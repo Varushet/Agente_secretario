@@ -1,105 +1,98 @@
-# app.py
 from flask import Flask, request, jsonify
 import ollama
-import re
 from datetime import datetime
+import json
+import re
 
 app = Flask(__name__)
 
-class AppointmentAgent:
+def clean_llm_response(text: str) -> str:
+    """
+    Elimina bloques <think>...</think> del texto generado por el LLM.
+    También elimina cualquier línea que empiece con <think> si no está bien cerrada.
+    """
+    # Elimina bloques completos <think> ... </think>
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+
+    # Elimina líneas sueltas que empiecen con <think> (por si acaso no se cerró)
+    text = re.sub(r'^\s*<think>.*$', '', text, flags=re.MULTILINE)
+
+    # Limpia espacios en blanco extra (saltos de línea, espacios al inicio/fin)
+    text = re.sub(r'\n\s*\n', '\n', text)  # elimina líneas vacías múltiples
+    text = text.strip()
+
+    return text
+
+class NaturalAppointmentAgent:
     def __init__(self, model_name="qwen3:8b"):
         self.model = model_name
-        self.conversation_history = []
-        self.user_data = {}  # Aquí guardamos los datos recolectados
-        self.required_fields = [
-            "nombre", "apellido", "telefono", "email", "fecha", "hora", "motivo"
+        self.user_data = {}
+        self.conversation_history = [
+            {
+                "role": "system",
+                "content": (
+                    "Eres un amable asistente de agendamiento de citas llamado SecretarioAI. "
+                    "Tu objetivo es recolectar 7 datos del usuario de forma natural y amable: "
+                    "nombre, apellido, teléfono, email, fecha (dd/mm/aa), hora (24h), y motivo de la cita. "
+                    "No preguntes de forma rígida. Si el usuario da varios datos juntos, extráelos. "
+                    "Si falta algo, pide amablemente por ello en contexto. "
+                    "Cuando tengas todos los datos, confirma con un resumen claro y alegre. "
+                    "Sé empático, usa emojis ocasionalmente y mantén un tono cálido y profesional. "
+                    "NO digas 'campo incompleto' ni 'formato inválido'. Corrige con amabilidad si hay errores. "
+                    "Ejemplo: si dice 'a las 4', puedes responder '¿Te refieres a las 16:00?'. "
+                    "Cuando completes la cita, di algo como: '¡Genial! Tu cita está confirmada 🎉'."
+                )
+            }
         ]
-        self.current_field = None  # Campo que estamos pidiendo ahora
 
     def is_data_complete(self):
-        return all(key in self.user_data for key in self.required_fields)
+        required = ["nombre", "apellido", "telefono", "email", "fecha", "hora", "motivo"]
+        return all(key in self.user_data for key in required)
 
-    def get_next_missing_field(self):
-        for field in self.required_fields:
-            if field not in self.user_data:
-                return field
-        return None
+    def extract_data_with_llm(self, user_message):
+        """Envía la conversación al LLM y limpia su respuesta."""
+        messages = self.conversation_history + [{"role": "user", "content": user_message}]
 
-    def validate_field(self, field, value):
-        """Valida el valor según el campo."""
-        if field == "email":
-            return re.match(r"[^@]+@[^@]+\.[^@]+", value) is not None
-        elif field == "telefono":
-            return re.match(r"^\+?\d{8,15}$", value.replace(" ", "")) is not None
-        elif field == "fecha":
-            try:
-                datetime.strptime(value, "%d/%m/%y")
-                return True
-            except ValueError:
-                return False
-        elif field == "hora":
-            try:
-                datetime.strptime(value, "%H:%M")
-                return True
-            except ValueError:
-                return False
-        else:
-            return len(value.strip()) > 0
+        try:
+            response = ollama.chat(
+                model=self.model,
+                messages=messages,
+                # format="json" ← Asegúrate de que ESTO esté eliminado
+            )
+            raw_content = response['message']['content']
+            # ¡LIMPIAMOS la respuesta!
+            cleaned_content = clean_llm_response(raw_content)
+            return cleaned_content
+        except Exception as e:
+            return f"Lo siento, tuve un problema técnico. ¿Podrías repetirlo, por favor? 😅"
 
-    def ask_for_field(self, field):
-        prompts = {
-            "nombre": "Por favor, dime tu nombre.",
-            "apellido": "Ahora, ¿cuál es tu apellido?",
-            "telefono": "¿Podrías darme tu número de teléfono? (Ej: +34 600 123 456)",
-            "email": "Necesito tu email para confirmarte la cita. ¿Cuál es?",
-            "fecha": "¿Qué fecha deseas para la cita? (Formato: dd/mm/aa, ej: 25/12/25)",
-            "hora": "¿A qué hora? (Formato 24h, ej: 15:30)",
-            "motivo": "Por último, ¿cuál es el motivo de la cita?"
-        }
-        return prompts.get(field, f"Por favor, proporciona tu {field}.")
-
-    def process_message(self, user_message: str) -> str:
-        # Si ya tenemos todos los datos, mostrar resumen
-        if self.is_data_complete():
-            return self.generate_summary()
-
-        # Si estamos esperando un campo, intentamos validarlo
-        if self.current_field:
-            if self.validate_field(self.current_field, user_message):
-                self.user_data[self.current_field] = user_message.strip()
-                self.current_field = None
-            else:
-                return f"❌ Eso no parece válido. {self.ask_for_field(self.current_field)}"
-
-        # Si no hay campo pendiente, pedimos el siguiente
-        if not self.current_field:
-            next_field = self.get_next_missing_field()
-            if next_field:
-                self.current_field = next_field
-                return self.ask_for_field(next_field)
-            else:
-                return self.generate_summary()
-
-        # Respuesta por defecto (no debería llegar aquí)
-        return "Gracias por tu mensaje. Estoy recopilando tu información."
+    def update_data_from_llm_response(self, llm_response):
+        """Intenta extraer datos estructurados si el LLM los envía en JSON."""
+        try:
+            # Intentamos parsear como JSON (opcional, si decides guiar al LLM a responder en JSON cuando tenga datos)
+            data = json.loads(llm_response)
+            for key in ["nombre", "apellido", "telefono", "email", "fecha", "hora", "motivo"]:
+                if key in data and isinstance(data[key], str) and data[key].strip():
+                    self.user_data[key] = data[key].strip()
+        except:
+            # Si no es JSON, no actualizamos datos estructurados (dejamos que la conversación fluya)
+            pass
 
     def generate_summary(self):
         data = self.user_data
         summary = (
-            f"✅ ¡Cita agendada con éxito!\n\n"
+            f"✅ ¡Cita confirmada con éxito! 🎉\n\n"
             f"📅 Fecha: {data['fecha']} a las {data['hora']}\n"
             f"👤 Paciente: {data['nombre']} {data['apellido']}\n"
             f"📞 Teléfono: {data['telefono']}\n"
             f"✉️ Email: {data['email']}\n"
             f"📝 Motivo: {data['motivo']}\n\n"
-            f"¡Te esperamos! 😊"
+            f"¡Estamos encantados de atenderte! Cualquier cambio, avísanos con 24h de antelación 😊"
         )
-        # Aquí podrías guardar en archivo, base de datos, enviar email, etc.
         self.save_appointment_to_file()
         return summary
 
     def save_appointment_to_file(self):
-        """Guarda la cita en un archivo de texto (mejorable luego con JSON o DB)."""
         with open("citas.txt", "a", encoding="utf-8") as f:
             f.write("="*50 + "\n")
             f.write(f"CITA AGENDADA - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
@@ -107,33 +100,34 @@ class AppointmentAgent:
                 f.write(f"{key.upper()}: {value}\n")
             f.write("\n")
 
-    def reset(self):
-        """Reinicia la recolección de datos."""
-        self.user_data = {}
-        self.current_field = None
-
     def send_message(self, user_message: str) -> str:
         try:
-            # Si el usuario dice "reiniciar" o "empezar de nuevo", reseteamos
-            if user_message.lower() in ["reiniciar", "reset", "empezar de nuevo", "nueva cita"]:
-                self.reset()
-                return "🔄 ¡Empecemos de nuevo! " + self.ask_for_field(self.get_next_missing_field())
+            # Añadimos el mensaje del usuario al historial
+            self.conversation_history.append({"role": "user", "content": user_message})
 
-            # Procesamos el mensaje para recolectar datos
-            bot_reply = self.process_message(user_message)
+            # Pedimos al LLM que responda (extrayendo datos o guiando)
+            llm_response = self.extract_data_with_llm(user_message)
 
-            # Guardamos en historial para contexto del LLM (opcional, mejora respuestas)
-            self.conversation_history.append({'role': 'user', 'content': user_message})
-            self.conversation_history.append({'role': 'assistant', 'content': bot_reply})
+            # Intentamos extraer datos estructurados (opcional, mejorable)
+            self.update_data_from_llm_response(llm_response)
 
-            return bot_reply
+            # Si todos los datos están completos, generamos resumen
+            if self.is_data_complete():
+                final_response = self.generate_summary()
+            else:
+                final_response = llm_response
+
+            # Añadimos la respuesta del bot al historial
+            self.conversation_history.append({"role": "assistant", "content": final_response})
+
+            return final_response
 
         except Exception as e:
-            return f"Error: {str(e)}"
+            return f"Error inesperado: {str(e)}"
 
 
-# Creamos una instancia global del agente
-agent = AppointmentAgent()
+# Instancia global
+agent = NaturalAppointmentAgent()
 
 @app.route('/chat', methods=['POST'])
 def chat():
@@ -151,5 +145,6 @@ def home():
     return app.send_static_file('index.html')
 
 if __name__ == '__main__':
-    print("🚀 Servidor de Agente Secretario iniciado en http://localhost:5000")
+    print("🚀 SecretarioAI - Asistente de citas conversacional")
+    print("👉 Abre http://localhost:5000 en tu navegador")
     app.run(debug=True)
