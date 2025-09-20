@@ -1,0 +1,134 @@
+<!-- static/index.html -->
+<!DOCTYPE html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Chatbot con Qwen3:8b</title>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        max-width: 800px;
+        margin: 40px auto;
+        background: #0a0b35;
+        padding: 20px;
+      }
+      h1 {
+        color: white;
+      }
+      #chatbox {
+        height: 400px;
+        border: 1px solid #ccc;
+        padding: 15px;
+        overflow-y: auto;
+        color: white;
+        background: #111261;
+        margin-bottom: 15px;
+        border-radius: 8px;
+      }
+      .user {
+        text-align: right;
+        color: #808080;
+        margin: 5px 0;
+      }
+      .bot {
+        text-align: left;
+        color: #ccc;
+        margin: 5px 0;
+      }
+      #user-input {
+        width: 70%;
+        padding: 10px;
+        border: 1px solid #ccc;
+        border-radius: 4px;
+      }
+      #send-btn {
+        padding: 10px 20px;
+        background: #0066cc;
+        color: white;
+        border: none;
+        border-radius: 4px;
+        cursor: pointer;
+      }
+      #send-btn:hover {
+        background: #0055aa;
+      }
+      .thinking {
+        color: #888;
+        font-style: italic;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>💬 Chat con tu Agente AI (Qwen3:8b)</h1>
+    <div id="chatbox"></div>
+    <input
+      type="text"
+      id="user-input"
+      placeholder="Escribe tu mensaje..."
+      autocomplete="off"
+    />
+    <button id="send-btn">Enviar</button>
+
+    <script>
+      const chatbox = document.getElementById("chatbox");
+      const userInput = document.getElementById("user-input");
+      const sendBtn = document.getElementById("send-btn");
+
+      function addMessage(text, sender) {
+        const p = document.createElement("p");
+        p.className = sender;
+        p.textContent = sender === "user" ? "Tú: " + text : "🤖: " + text;
+        chatbox.appendChild(p);
+        chatbox.scrollTop = chatbox.scrollHeight;
+      }
+
+      async function sendMessage() {
+        const message = userInput.value.trim();
+        if (!message) return;
+
+        addMessage(message, "user");
+        userInput.value = "";
+
+        // Mostrar "Pensando..."
+        const thinkingElem = document.createElement("p");
+        thinkingElem.className = "thinking";
+        thinkingElem.id = "thinking";
+        thinkingElem.textContent = "🧠 Pensando...";
+        chatbox.appendChild(thinkingElem);
+        chatbox.scrollTop = chatbox.scrollHeight;
+
+        try {
+          const response = await fetch("/chat", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ message }),
+          });
+
+          const data = await response.json();
+
+          // Eliminar "Pensando..."
+          const thinking = document.getElementById("thinking");
+          if (thinking) thinking.remove();
+
+          if (data.response) {
+            addMessage(data.response, "bot");
+          } else {
+            addMessage("Error: " + (data.error || "Desconocido"), "bot");
+          }
+        } catch (error) {
+          const thinking = document.getElementById("thinking");
+          if (thinking) thinking.remove();
+          addMessage("⚠️ Error de conexión con el servidor.", "bot");
+        }
+      }
+
+      sendBtn.addEventListener("click", sendMessage);
+      userInput.addEventListener("keypress", (e) => {
+        if (e.key === "Enter") sendMessage();
+      });
+    </script>
+  </body>
+</html>
