@@ -38,7 +38,7 @@ SCOPES = [
 ]
 
 
-def get_authorization_url(state):  # ← Acepta state como parámetro
+def get_authorization_url(state):
     """Genera la URL de autorización de Google."""
     try:
         from google_auth_oauthlib.flow import Flow
@@ -48,16 +48,14 @@ def get_authorization_url(state):  # ← Acepta state como parámetro
             redirect_uri='http://localhost:5000/callback'
         )
         auth_url, _ = flow.authorization_url(
-            access_type='offline',
+            access_type='offline',  # ← ESTO ES CLAVE
+            prompt='consent',       # ← Fuerza consentimiento para obtener refresh_token
             include_granted_scopes='true',
-            state=state  # ← USA EL PARÁMETRO state, NO LA VARIABLE GLOBAL
+            state=state
         )
         return auth_url, flow
     except Exception as e:
         raise Exception(f"Error en get_authorization_url: {str(e)}")
-
-# Almacena el flow globalmente (en producción, usa sesión o caché)
-global_flow = None
 
 def get_calendar_service():
     """Obtiene el servicio de Google Calendar usando token.json pre-autenticado."""
@@ -99,7 +97,7 @@ class NaturalAppointmentAgent:
                     "Sé empático, usa emojis ocasionalmente y mantén un tono cálido y profesional. "
                     "NO digas 'campo incompleto' ni 'formato inválido'. Corrige con amabilidad si hay errores. "
                     "Ejemplo: si dice 'a las 4', puedes responder '¿Te refieres a las 16:00?'. "
-                    "Cuando completes la cita, di algo como: '¡Genial! Tu cita está confirmada 🎉'."
+                    "Cuando completes los datos, mándalos a la aplicación y confirma la cita'."
                 )
             }
         ]
@@ -122,7 +120,7 @@ class NaturalAppointmentAgent:
             response = ollama.chat(
                 model=self.model,
                 messages=messages,
-                # format="json" ← Asegúrate de que ESTO esté eliminado
+                format="json"
             )
             raw_content = response['message']['content']
             # ¡LIMPIAMOS la respuesta!
@@ -132,18 +130,47 @@ class NaturalAppointmentAgent:
             return f"Lo siento, tuve un problema técnico. ¿Podrías repetirlo, por favor? 😅"
 
     def update_data_from_llm_response(self, llm_response):
-        """Intenta extraer datos estructurados si el LLM los envía en JSON."""
+        """Extrae datos estructurados del JSON del LLM."""
         try:
-            # Intentamos parsear como JSON (opcional, si decides guiar al LLM a responder en JSON cuando tenga datos)
-            data = json.loads(llm_response)
-            for key in ["nombre", "apellido", "telefono", "email", "fecha", "hora", "motivo"]:
-                if key in data and isinstance(data[key], str) and data[key].strip():
-                    self.user_data[key] = data[key].strip()
-        except:
-            # Si no es JSON, no actualizamos datos estructurados (dejamos que la conversación fluya)
-            pass
-
+            print(f"📨 Respuesta LLM para extracción: {llm_response}")
+            
+            # Limpia la respuesta antes de parsear JSON
+            cleaned_response = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', llm_response)
+            cleaned_response = cleaned_response.strip()
+            
+            # Intenta parsear como JSON
+            data = json.loads(cleaned_response)
+            print(f"✅ JSON parseado: {data}")
+            
+            # EXTRAE LOS DATOS DE LA CLAVE 'data' SI EXISTE
+            if 'data' in data and isinstance(data['data'], dict):
+                user_data = data['data']
+                print(f"📊 Datos extraídos: {user_data}")
+                
+                # Extrae datos si están presentes
+                for key in ["nombre", "apellido", "telefono", "email", "fecha", "hora", "motivo"]:
+                    if key in user_data and user_data[key] and user_data[key] != "?":
+                        self.user_data[key] = str(user_data[key]).strip()
+                        print(f"📝 Guardado {key}: {user_data[key]}")
+            else:
+                # Si no hay clave 'data', intenta extraer directamente
+                for key in ["nombre", "apellido", "telefono", "email", "fecha", "hora", "motivo"]:
+                    if key in data and data[key] and data[key] != "?":
+                        self.user_data[key] = str(data[key]).strip()
+                        print(f"📝 Guardado {key}: {data[key]}")
+                    
+        except json.JSONDecodeError as e:
+            print(f"❌ No se pudo decodificar JSON: {e}")
+            print(f"📄 Contenido que falló: {llm_response}")
+        except Exception as e:
+            print(f"❌ Error en update_data: {e}")
+        
     def generate_summary(self):
+        print(f"🔍 GENERATE_SUMMARY llamado con datos: {self.user_data}")
+        
+        if not self.is_data_complete():
+            return "❌ Error: Datos incompletos para generar resumen"
+        
         data = self.user_data
         summary = (
             f"✅ ¡Cita confirmada con éxito! 🎉\n\n"
@@ -155,12 +182,13 @@ class NaturalAppointmentAgent:
         )
 
         # Intentamos agendar en Google Calendar
+        print("🔄 Intentando crear evento en Google Calendar...")
         if self.create_calendar_event():
             summary += "\n🗓️ ¡Cita añadida a tu calendario de Google!"
+            print("✅ Evento creado exitosamente en Google Calendar")
         else:
             summary += "\n⚠️ No pude añadir la cita a Google Calendar (revisa logs)."
-
-        summary += "\n\n¡Estamos encantados de atenderte! Cualquier cambio, avísanos con 24h de antelación 😊"
+            print("❌ Fallo al crear evento en Google Calendar")
 
         self.save_appointment_to_file()
         return summary
@@ -226,24 +254,42 @@ class NaturalAppointmentAgent:
         try:
             self.conversation_history.append({"role": "user", "content": user_message})
             llm_response = self.extract_data_with_llm(user_message)
-            self.update_data_from_llm_response(llm_response)
-
-            print(f"🤖 LLM respondió: {llm_response}")
-            print(f"📊 User data después de update: {self.user_data}")
             
-            if self.is_data_complete():
-                print("🎯 Todos los datos completos - generando resumen")
-                final_response = self.generate_summary()
-            else:
-                print("⚠️ Datos incompletos - usando respuesta LLM")
+            # Intenta extraer datos del JSON
+            self.update_data_from_llm_response(llm_response)
+            
+            # Parsea la respuesta JSON para determinar qué hacer
+            try:
+                response_data = json.loads(llm_response)
+                
+                # Verifica si es una respuesta de finalización (con datos completos)
+                if ('data' in response_data and 
+                    all(key in response_data['data'] for key in ["nombre", "apellido", "telefono", "email", "fecha", "hora", "motivo"])):
+                    
+                    print("🎯 Todos los datos completos - generando resumen y creando evento")
+                    final_response = self.generate_summary()
+                    
+                elif "pregunta" in response_data:
+                    # El LLM necesita más información
+                    final_response = response_data["pregunta"]
+                else:
+                    # Respuesta normal del LLM
+                    final_response = llm_response
+                    
+            except json.JSONDecodeError:
+                # Si no es JSON válido, usa la respuesta tal cual
                 final_response = llm_response
+
+            # VERIFICACIÓN FINAL - si los datos están completos, crear evento
+            if self.is_data_complete() and "generate_summary" not in final_response:
+                print("✅ Verificación final - datos completos, creando evento")
+                final_response = self.generate_summary()
 
             self.conversation_history.append({"role": "assistant", "content": final_response})
             return final_response
 
         except Exception as e:
             return f"Error inesperado: {str(e)}"
-
 
 # Instancia global
 agent = NaturalAppointmentAgent()
