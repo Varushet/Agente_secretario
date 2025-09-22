@@ -1,6 +1,9 @@
 # Archivos de credenciales
 credentials.json
 token.json
+.env
+*.pyc
+__pycache__/
 
 # Archivos de caché de Python
 __pycache__/

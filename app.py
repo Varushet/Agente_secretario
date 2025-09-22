@@ -3,12 +3,14 @@ import os.path
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
-import ollama
 from datetime import datetime, timedelta
 import json
 import re
 import secrets
+from groq import Groq
+from dotenv import load_dotenv
 
+load_dotenv()
 
 app = Flask(__name__)
 
@@ -81,26 +83,43 @@ def get_calendar_service():
         return None
 
 class NaturalAppointmentAgent:
-    def __init__(self, model_name="qwen3:8b"):
+    def __init__(self, model_name="qwen/qwen3-32b"):
         self.model = model_name
         self.user_data = {}
         self.conversation_history = [
             {
                 "role": "system",
                 "content": (
-                    "Eres un amable asistente de agendamiento de citas llamado SecretarioAI. "
-                    "Tu objetivo es recolectar 7 datos del usuario de forma natural y amable: "
-                    "nombre, apellido, teléfono, email, fecha (dd/mm/aa), hora (24h), y motivo de la cita. "
-                    "No preguntes de forma rígida. Si el usuario da varios datos juntos, extráelos. "
-                    "Si falta algo, pide amablemente por ello en contexto. "
-                    "Cuando tengas todos los datos, confirma con un resumen claro y alegre. "
-                    "Sé empático, usa emojis ocasionalmente y mantén un tono cálido y profesional. "
-                    "NO digas 'campo incompleto' ni 'formato inválido'. Corrige con amabilidad si hay errores. "
-                    "Ejemplo: si dice 'a las 4', puedes responder '¿Te refieres a las 16:00?'. "
-                    "Cuando completes los datos, mándalos a la aplicación y confirma la cita'."
+                    "Eres SecretarioAI, un asistente de agendamiento de citas EMPÁTICO, AMABLE y CONVERSACIONAL. "
+                    "Tu misión es recolectar 7 datos del usuario de forma NATURAL: nombre, apellido, teléfono, email, fecha (dd/mm/aa), hora (24h) y motivo. "
+                    "NUNCA respondas con mensajes técnicos como 'Error: datos incompletos'. "
+                    "En lugar de eso, habla como un humano: usa emojis 😊, tono cálido, frases coloquiales y refuerzos positivos. "
+                    "Si el usuario da varios datos juntos, ¡agradece y confirma! Si falta algo, pide amablemente en contexto. "
+                    "Ej: '¿A qué hora te vendría bien? 😊' o '¿Me das tu email para enviarte el recordatorio? 📩' "
+                    "\n\n"
+                    "IMPORTANTE: SIEMPRE genera tu respuesta en este formato JSON EXACTO:\n"
+                    "{\n"
+                    '  "respuesta": "tu mensaje amable y natural al usuario",\n'
+                    '  "data": {\n'
+                    '    "nombre": "?",\n'
+                    '    "apellido": "?",\n'
+                    '    "telefono": "?",\n'
+                    '    "email": "?",\n'
+                    '    "fecha": "?",\n'
+                    '    "hora": "?",\n'
+                    '    "motivo": "?"\n'
+                    "  }\n"
+                    "}\n"
+                    "Llena solo los campos que puedas extraer. Usa ? para los desconocidos. "
+                    "Cuando TODOS los datos estén completos, responde con un mensaje de confirmación ALEGRE y detallado, "
+                    "y asegúrate de que 'data' tenga todos los valores reales (sin ?). "
+                    "¡Nunca omitas 'respuesta'! ¡Siempre incluye un mensaje humano!"
                 )
             }
         ]
+    
+        groq_api_key = os.getenv('GROQ_API_KEY')
+        self.client = Groq(api_key=groq_api_key)
 
     def is_data_complete(self):
         required = ["nombre", "apellido", "telefono", "email", "fecha", "hora", "motivo"]
@@ -113,16 +132,23 @@ class NaturalAppointmentAgent:
         return is_complete
 
     def extract_data_with_llm(self, user_message):
-        """Envía la conversación al LLM y limpia su respuesta."""
+        """Envía la conversación al LLM usando Groq API y limpia su respuesta."""
         messages = self.conversation_history + [{"role": "user", "content": user_message}]
 
         try:
-            response = ollama.chat(
-                model=self.model,
+            # Llamada a Groq
+            chat_completion = self.client.chat.completions.create(
                 messages=messages,
-                format="json"
+                model=self.model,
+                temperature=0.3,
+                max_tokens=512,
+                top_p=1,
+                stream=False,
+                stop=None,
+                response_format={"type": "json_object"}  # ¡IMPORTANTE! Forzamos JSON
             )
-            raw_content = response['message']['content']
+            
+            raw_content = chat_completion.choices[0].message.content
             # ¡LIMPIAMOS la respuesta!
             cleaned_content = clean_llm_response(raw_content)
             return cleaned_content
@@ -189,8 +215,6 @@ class NaturalAppointmentAgent:
         else:
             summary += "\n⚠️ No pude añadir la cita a Google Calendar (revisa logs)."
             print("❌ Fallo al crear evento en Google Calendar")
-
-        self.save_appointment_to_file()
         return summary
     
     def create_calendar_event(self):
@@ -201,13 +225,11 @@ class NaturalAppointmentAgent:
                 return False
 
             # Formato de fecha y hora para Google Calendar (ISO 8601)
-            # Suponemos que la fecha está en formato dd/mm/aa → lo convertimos
             fecha_str = self.user_data['fecha']  # ej: "25/12/25"
             hora_str = self.user_data['hora']    # ej: "16:30"
 
             # Convertir a datetime
             fecha_hora_inicio = datetime.strptime(f"{fecha_str} {hora_str}", "%d/%m/%y %H:%M")
-            # La cita dura 1 hora (puedes cambiarlo)
             fecha_hora_fin = fecha_hora_inicio + timedelta(hours=1)
 
             event = {
@@ -219,7 +241,7 @@ class NaturalAppointmentAgent:
                 ),
                 'start': {
                     'dateTime': fecha_hora_inicio.isoformat(),
-                    'timeZone': 'Europe/Madrid',  # ¡Cámbialo a tu zona horaria!
+                    'timeZone': 'Europe/Madrid',
                 },
                 'end': {
                     'dateTime': fecha_hora_fin.isoformat(),
@@ -228,8 +250,8 @@ class NaturalAppointmentAgent:
                 'reminders': {
                     'useDefault': False,
                     'overrides': [
-                        {'method': 'email', 'minutes': 24 * 60},  # 1 día antes
-                        {'method': 'popup', 'minutes': 30},       # 30 min antes
+                        {'method': 'email', 'minutes': 24 * 60},
+                        {'method': 'popup', 'minutes': 30},
                     ],
                 },
             }
@@ -241,55 +263,36 @@ class NaturalAppointmentAgent:
         except Exception as e:
             print(f"❌ Error al crear evento en Google Calendar: {str(e)}")
             return False
-        
-    def save_appointment_to_file(self):
-        with open("citas.txt", "a", encoding="utf-8") as f:
-            f.write("="*50 + "\n")
-            f.write(f"CITA AGENDADA - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            for key, value in self.user_data.items():
-                f.write(f"{key.upper()}: {value}\n")
-            f.write("\n")
 
     def send_message(self, user_message: str) -> str:
         try:
             self.conversation_history.append({"role": "user", "content": user_message})
             llm_response = self.extract_data_with_llm(user_message)
             
-            # Intenta extraer datos del JSON
+            print(f"🤖 RESPUESTA CRUDA DE GROQ: {llm_response}")
+
+            # Extraer datos estructurados (solo para uso interno)
             self.update_data_from_llm_response(llm_response)
-            
-            # Parsea la respuesta JSON para determinar qué hacer
+
+            # Parsear JSON para obtener la respuesta amable
             try:
                 response_data = json.loads(llm_response)
-                
-                # Verifica si es una respuesta de finalización (con datos completos)
-                if ('data' in response_data and 
-                    all(key in response_data['data'] for key in ["nombre", "apellido", "telefono", "email", "fecha", "hora", "motivo"])):
-                    
-                    print("🎯 Todos los datos completos - generando resumen y creando evento")
-                    final_response = self.generate_summary()
-                    
-                elif "pregunta" in response_data:
-                    # El LLM necesita más información
-                    final_response = response_data["pregunta"]
-                else:
-                    # Respuesta normal del LLM
-                    final_response = llm_response
-                    
+                final_response = response_data.get("respuesta", "Gracias por la información. ¿Hay algo más que pueda ayudarte? 😊")
             except json.JSONDecodeError:
-                # Si no es JSON válido, usa la respuesta tal cual
-                final_response = llm_response
+                # Si falla, usar respuesta de respaldo amable
+                final_response = "Gracias por tu mensaje. Déjame ayudarte a organizar tu cita 😊 ¿Podrías darme tu nombre completo?"
 
-            # VERIFICACIÓN FINAL - si los datos están completos, crear evento
-            if self.is_data_complete() and "generate_summary" not in final_response:
-                print("✅ Verificación final - datos completos, creando evento")
+            # VERIFICACIÓN FINAL: si los datos están completos, generar resumen
+            if self.is_data_complete():
+                print("✅ Datos completos detectados - generando resumen final")
                 final_response = self.generate_summary()
 
             self.conversation_history.append({"role": "assistant", "content": final_response})
             return final_response
 
         except Exception as e:
-            return f"Error inesperado: {str(e)}"
+            print(f"💥 Error inesperado en send_message: {str(e)}")
+            return "Lo siento, tuve un pequeño error técnico. ¿Podrías repetirme eso con más calma? 😅 Te prometo que lo arreglaré en un segundo."
 
 # Instancia global
 agent = NaturalAppointmentAgent()
