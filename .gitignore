@@ -1,0 +1,26 @@
+# Archivos de credenciales
+credentials.json
+token.json
+
+# Archivos de caché de Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Entorno virtual
+venv/
+env/
+.env/
+
+# Archivos del sistema
+.DS_Store
+Thumbs.db
+
+# Archivos de logs
+*.log
+citas.txt
+
+# Archivos de IDE
+.vscode/
+.idea/
+*.swp
