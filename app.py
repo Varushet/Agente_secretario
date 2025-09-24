@@ -1,9 +1,7 @@
-from flask import Flask, request, jsonify, session
+from flask import Flask, request, jsonify
 import os.path
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build
 from datetime import datetime, timedelta
+import requests
 import json
 import re
 import secrets
@@ -15,6 +13,110 @@ load_dotenv()
 app = Flask(__name__)
 
 app.secret_key = secrets.token_hex(32) 
+
+def find_timp_slot(activity_id: int, date: str, time: str) -> str | None:
+    """
+    Busca un slot disponible en TIMP.
+    Retorna el slot_id (str) si está disponible, None si no.
+    """
+    url = f"https://panel.timp.pro/api/user_app/v2/activities/{activity_id}/admissions"
+    params = {'date': date}
+
+    headers = {
+        'accept': 'application/timp.user-app-v2',
+        'accept-language': 'en_US',
+        'api-access-key': os.getenv('TIMP_API_KEY'),
+        'app-platform': 'web',
+        'app-version': '8.7.0',
+        'content-type': 'application/json',
+        'origin': 'https://web.timp.pro/',
+        'referer': 'https://web.timp.pro/',
+        'sec-ch-ua': '"Chromium";v="140", "Not=A?Brand";v="24", "Google Chrome";v="140"',
+        'sec-ch-ua-mobile': '?1',
+        'sec-ch-ua-platform': '"Android"',
+        'sec-fetch-dest': 'empty',
+        'sec-fetch-mode': 'cors',
+        'sec-fetch-site': 'same-site',
+        'time-zone': 'Europe/Madrid',
+        'user-agent': 'Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36'
+    }
+
+    try:
+        response = requests.get(url, headers=headers, params=params)
+        if response.status_code != 200:
+            print(f"❌ Error al buscar slots: {response.status_code} - {response.text}")
+            return None
+
+        slots = response.json()  # ← La respuesta es una LISTA de slots
+
+        for slot in slots:
+            if slot.get('status') == 'available':
+                # Extraer la hora de inicio de "20:15 - 21:00" → "20:15"
+                hours_str = slot.get('hours', '')
+                start_time = hours_str.split(' - ')[0] if ' - ' in hours_str else hours_str
+
+                if start_time == time:
+                    slot_id = slot['id']
+                    print(f"✅ Slot encontrado: ID={slot_id}, Hora={start_time}")
+                    return slot_id
+
+        print("❌ No se encontró slot disponible a esa hora.")
+        return None
+
+    except Exception as e:
+        print(f"⚠️ Excepción al buscar slot: {str(e)}")
+        return None
+
+def get_available_dates_for_therapy(activity_id: int, days_ahead: int = 7) -> dict:
+    available = {}
+    headers = {
+        'accept': 'application/timp.user-app-v2',
+        'accept-language': 'en_US',
+        'api-access-key': os.getenv('TIMP_API_KEY'),
+        'app-platform': 'web',
+        'app-version': '8.7.0',
+        'content-type': 'application/json',
+        'origin': 'https://web.timp.pro/',
+        'referer': 'https://web.timp.pro/',
+        'sec-ch-ua': '"Chromium";v="140", "Not=A?Brand";v="24", "Google Chrome";v="140"',
+        'sec-ch-ua-mobile': '?1',
+        'sec-ch-ua-platform': '"Android"',
+        'sec-fetch-dest': 'empty',
+        'sec-fetch-mode': 'cors',
+        'sec-fetch-site': 'same-site',
+        'time-zone': 'Europe/Madrid',
+        'user-agent': 'Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36'
+    }
+
+    today = datetime.today()
+    for i in range(days_ahead):
+        check_date = (today + timedelta(days=i)).strftime("%Y-%m-%d")
+        url = f"https://panel.timp.pro/api/user_app/v2/activities/{activity_id}/admissions"
+        params = {'date': check_date}
+
+        try:
+            response = requests.get(url, headers=headers, params=params)
+            if response.status_code != 200:
+                continue
+
+            slots = response.json()
+            slots_today = []
+
+            for slot in slots:
+                if slot.get('status') == 'available':
+                    hours_str = slot.get('hours', '')
+                    start_time = hours_str.split(' - ')[0] if ' - ' in hours_str else hours_str
+                    slots_today.append(start_time)
+
+            if slots_today:
+                formatted_date = datetime.strptime(check_date, "%Y-%m-%d").strftime("%d/%m")
+                available[formatted_date] = sorted(set(slots_today))
+
+        except Exception as e:
+            print(f"⚠️ Error checking date {check_date}: {e}")
+            continue
+
+    return available
 
 def clean_llm_response(text: str) -> str:
     """
@@ -33,55 +135,6 @@ def clean_llm_response(text: str) -> str:
 
     return text
 
-# Si modificas el scope, borra token.json para volver a autenticar
-SCOPES = [
-    'https://www.googleapis.com/auth/calendar',
-    'https://www.googleapis.com/auth/calendar.events'
-]
-
-
-def get_authorization_url(state):
-    """Genera la URL de autorización de Google."""
-    try:
-        from google_auth_oauthlib.flow import Flow
-        flow = Flow.from_client_secrets_file(
-            'credentials.json',
-            scopes=SCOPES,
-            redirect_uri='http://localhost:5000/callback'
-        )
-        auth_url, _ = flow.authorization_url(
-            access_type='offline',  # ← ESTO ES CLAVE
-            prompt='consent',       # ← Fuerza consentimiento para obtener refresh_token
-            include_granted_scopes='true',
-            state=state
-        )
-        return auth_url, flow
-    except Exception as e:
-        raise Exception(f"Error en get_authorization_url: {str(e)}")
-
-def get_calendar_service():
-    """Obtiene el servicio de Google Calendar usando token.json pre-autenticado."""
-    if not os.path.exists('token.json'):
-        print("❌ Error: token.json no encontrado. Visita /authorize primero.")
-        return None
-
-    try:
-        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
-        if creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-            with open('token.json', 'w') as token:
-                token.write(creds.to_json())
-        if not creds.valid:
-            print("❌ Error: Token inválido o expirado. Visita /authorize.")
-            return None
-
-        service = build('calendar', 'v3', credentials=creds)
-        return service
-
-    except Exception as e:
-        print(f"❌ Error al construir el servicio de Calendar: {e}")
-        return None
-
 class NaturalAppointmentAgent:
     def __init__(self, model_name="qwen/qwen3-32b"):
         self.model = model_name
@@ -91,23 +144,19 @@ class NaturalAppointmentAgent:
                 "role": "system",
                 "content": (
                     "Eres SecretarioAI, un asistente de agendamiento de citas EMPÁTICO, AMABLE y CONVERSACIONAL. "
-                    "Tu misión es recolectar 7 datos del usuario de forma NATURAL: nombre, apellido, teléfono, email, fecha (dd/mm/aa), hora (24h) y motivo. "
+                    "Tu misión es recolectar 3 datos del usuario de forma NATURAL: fecha (dd/mm/aa), hora (HH:MM) y terapia (Ondas, Fisioterapia, Indiba, Láser, Osteopatía, Amigdalitis). "
                     "NUNCA respondas con mensajes técnicos como 'Error: datos incompletos'. "
                     "En lugar de eso, habla como un humano: usa emojis 😊, tono cálido, frases coloquiales y refuerzos positivos. "
                     "Si el usuario da varios datos juntos, ¡agradece y confirma! Si falta algo, pide amablemente en contexto. "
-                    "Ej: '¿A qué hora te vendría bien? 😊' o '¿Me das tu email para enviarte el recordatorio? 📩' "
+                    "Ej: '¿A qué hora te vendría bien? 😊' o '¿Qué terapia necesitas hoy? Tenemos Ondas, Indiba, Láser... 🌿' "
                     "\n\n"
                     "IMPORTANTE: SIEMPRE genera tu respuesta en este formato JSON EXACTO:\n"
                     "{\n"
                     '  "respuesta": "tu mensaje amable y natural al usuario",\n'
                     '  "data": {\n'
-                    '    "nombre": "?",\n'
-                    '    "apellido": "?",\n'
-                    '    "telefono": "?",\n'
-                    '    "email": "?",\n'
                     '    "fecha": "?",\n'
                     '    "hora": "?",\n'
-                    '    "motivo": "?"\n'
+                    '    "terapia": "?"\n'
                     "  }\n"
                     "}\n"
                     "Llena solo los campos que puedas extraer. Usa ? para los desconocidos. "
@@ -122,13 +171,13 @@ class NaturalAppointmentAgent:
         self.client = Groq(api_key=groq_api_key)
 
     def is_data_complete(self):
-        required = ["nombre", "apellido", "telefono", "email", "fecha", "hora", "motivo"]
+        required = ["fecha", "hora", "terapia"]
         is_complete = all(key in self.user_data for key in required)
         
         print(f"🔍 Verificando datos completos: {is_complete}")
         print(f"📋 Datos actuales: {self.user_data}")
         print(f"✅ Faltantes: {[key for key in required if key not in self.user_data]}")
-        
+    
         return is_complete
 
     def extract_data_with_llm(self, user_message):
@@ -174,16 +223,10 @@ class NaturalAppointmentAgent:
                 print(f"📊 Datos extraídos: {user_data}")
                 
                 # Extrae datos si están presentes
-                for key in ["nombre", "apellido", "telefono", "email", "fecha", "hora", "motivo"]:
+                for key in ["fecha", "hora", "terapia"]:
                     if key in user_data and user_data[key] and user_data[key] != "?":
                         self.user_data[key] = str(user_data[key]).strip()
                         print(f"📝 Guardado {key}: {user_data[key]}")
-            else:
-                # Si no hay clave 'data', intenta extraer directamente
-                for key in ["nombre", "apellido", "telefono", "email", "fecha", "hora", "motivo"]:
-                    if key in data and data[key] and data[key] != "?":
-                        self.user_data[key] = str(data[key]).strip()
-                        print(f"📝 Guardado {key}: {data[key]}")
                     
         except json.JSONDecodeError as e:
             print(f"❌ No se pudo decodificar JSON: {e}")
@@ -199,71 +242,56 @@ class NaturalAppointmentAgent:
         
         data = self.user_data
         summary = (
-            f"✅ ¡Cita confirmada con éxito! 🎉\n\n"
+            f"✅ ¡Disponibilidad encontrada! 🎉\n\n"
             f"📅 Fecha: {data['fecha']} a las {data['hora']}\n"
-            f"👤 Paciente: {data['nombre']} {data['apellido']}\n"
-            f"📞 Teléfono: {data['telefono']}\n"
-            f"✉️ Email: {data['email']}\n"
-            f"📝 Motivo: {data['motivo']}\n"
+            f"💆‍♀️ Terapia: {data['terapia']}\n"
         )
 
-        # Intentamos agendar en Google Calendar
-        print("🔄 Intentando crear evento en Google Calendar...")
-        if self.create_calendar_event():
-            summary += "\n🗓️ ¡Cita añadida a tu calendario de Google!"
-            print("✅ Evento creado exitosamente en Google Calendar")
-        else:
-            summary += "\n⚠️ No pude añadir la cita a Google Calendar (revisa logs)."
-            print("❌ Fallo al crear evento en Google Calendar")
-        return summary
-    
-    def create_calendar_event(self):
-        """Crea un evento en Google Calendar con los datos recopilados."""
+        # Mapeo CORREGIDO con IDs reales de tu centro
+        THERAPY_TO_ACTIVITY_ID = {
+            "ondas": 94797,
+            "fisioterapia": 72574,
+            "indiba": 72573,
+            "láser": 94798,
+            "osteopatía": 72576,
+        }
+
+        terapia = data['terapia'].lower().strip()
+        activity_id = THERAPY_TO_ACTIVITY_ID.get(terapia)
+
+        if not activity_id:
+            return f"❌ Lo siento, no ofrecemos '{data['terapia']}' en este centro. ¿Te gustaría probar con Ondas, Fisioterapia, Indiba, Láser u Osteopatía? 😊"
+
+        # Convertir fecha al formato YYYY-MM-DD
         try:
-            service = get_calendar_service()
-            if not service:
-                return False
-
-            # Formato de fecha y hora para Google Calendar (ISO 8601)
-            fecha_str = self.user_data['fecha']  # ej: "25/12/25"
-            hora_str = self.user_data['hora']    # ej: "16:30"
-
-            # Convertir a datetime
-            fecha_hora_inicio = datetime.strptime(f"{fecha_str} {hora_str}", "%d/%m/%y %H:%M")
-            fecha_hora_fin = fecha_hora_inicio + timedelta(hours=1)
-
-            event = {
-                'summary': f"Cita: {self.user_data['motivo']}",
-                'description': (
-                    f"Paciente: {self.user_data['nombre']} {self.user_data['apellido']}\n"
-                    f"Teléfono: {self.user_data['telefono']}\n"
-                    f"Email: {self.user_data['email']}"
-                ),
-                'start': {
-                    'dateTime': fecha_hora_inicio.isoformat(),
-                    'timeZone': 'Europe/Madrid',
-                },
-                'end': {
-                    'dateTime': fecha_hora_fin.isoformat(),
-                    'timeZone': 'Europe/Madrid',
-                },
-                'reminders': {
-                    'useDefault': False,
-                    'overrides': [
-                        {'method': 'email', 'minutes': 24 * 60},
-                        {'method': 'popup', 'minutes': 30},
-                    ],
-                },
-            }
-
-            event = service.events().insert(calendarId='primary', body=event).execute()
-            print(f"✅ Evento creado: {event.get('htmlLink')}")
-            return True
-
+            fecha_dt = datetime.strptime(data['fecha'], "%d/%m/%y")
+            fecha_iso = fecha_dt.strftime("%Y-%m-%d")
+            hora_str = data['hora']  # "08:00"
         except Exception as e:
-            print(f"❌ Error al crear evento en Google Calendar: {str(e)}")
-            return False
+            print(f"❌ Error al parsear fecha/hora: {e}")
+            return "❌ Error: Formato de fecha u hora inválido. Usa dd/mm/aa y HH:MM, por favor."
 
+        # Buscar slot disponible (sin reservar)
+        slot_id = find_timp_slot(activity_id, fecha_iso, hora_str)
+
+        if not slot_id:
+            return (
+                f"❌ Lo siento, no hay disponibilidad para {data['terapia']} el {data['fecha']} a las {data['hora']}.\n"
+                "¿Te gustaría probar con otra hora o fecha? 😊"
+            )
+
+        # ✅ Construir el enlace REAL con el slot_id encontrado
+        BRANCH_BUILDING_ID = "11269"
+        cita_url = f"https://web.timp.pro/home/{BRANCH_BUILDING_ID}#/home/{BRANCH_BUILDING_ID}/branch_building/admissions/{slot_id}"
+
+        # ✅ Incluir el enlace en la respuesta
+        summary += f"\n🎯 **¡Listo! Haz clic aquí para reservar tu cita directamente**:\n"
+        summary += f"{cita_url}\n"
+        summary += "\n✨ Solo te tomará unos segundos. ¡Te esperamos! 💪"
+
+        return summary
+
+    
     def send_message(self, user_message: str) -> str:
         try:
             self.conversation_history.append({"role": "user", "content": user_message})
@@ -271,7 +299,7 @@ class NaturalAppointmentAgent:
             
             print(f"🤖 RESPUESTA CRUDA DE GROQ: {llm_response}")
 
-            # Extraer datos estructurados (solo para uso interno)
+            # Extraer datos estructurados
             self.update_data_from_llm_response(llm_response)
 
             # Parsear JSON para obtener la respuesta amable
@@ -279,12 +307,40 @@ class NaturalAppointmentAgent:
                 response_data = json.loads(llm_response)
                 final_response = response_data.get("respuesta", "Gracias por la información. ¿Hay algo más que pueda ayudarte? 😊")
             except json.JSONDecodeError:
-                # Si falla, usar respuesta de respaldo amable
-                final_response = "Gracias por tu mensaje. Déjame ayudarte a organizar tu cita 😊 ¿Podrías darme tu nombre completo?"
+                final_response = "Gracias por tu mensaje. Déjame ayudarte 😊"
 
-            # VERIFICACIÓN FINAL: si los datos están completos, generar resumen
-            if self.is_data_complete():
-                print("✅ Datos completos detectados - generando resumen final")
+            # ✅ NUEVO: Si el usuario dio terapia pero NO fecha/hora → mostrar disponibilidad
+            if "terapia" in self.user_data and "fecha" not in self.user_data and "hora" not in self.user_data:
+                terapia = self.user_data["terapia"].lower().strip()
+                THERAPY_TO_ACTIVITY_ID = {
+                    "ondas": 94797,
+                    "fisioterapia": 72574,
+                    "indiba": 72573,
+                    "láser": 94798,
+                    "osteopatía": 72576,
+                }
+                activity_id = THERAPY_TO_ACTIVITY_ID.get(terapia)
+
+                if activity_id:
+                    available_dates = get_available_dates_for_therapy(activity_id, days_ahead=7)
+                    if available_dates:
+                        disponibilidad = "\n".join([
+                            f"📅 {fecha} → {', '.join(horas)}"
+                            for fecha, horas in list(available_dates.items())[:5]  # Mostrar solo 5 días
+                        ])
+                        final_response = (
+                            f"¡Genial! 😊 Estas son las próximas fechas con disponibilidad para *{terapia.title()}*:\n\n"
+                            f"{disponibilidad}\n\n"
+                            "¿Qué fecha y hora te gustaría reservar? 🌞"
+                        )
+                    else:
+                        final_response = f"Lo siento, no hay disponibilidad para {terapia} en los próximos días. ¿Quieres que revise más adelante? 😊"
+                else:
+                    final_response = f"❌ No tengo configurada la terapia '{terapia}'. ¿Puedes elegir otra? Tenemos: Ondas, Fisioterapia, Indiba, Láser, Osteopatía."
+
+            # Si los 3 datos están completos → generar enlace
+            elif self.is_data_complete():
+                print("✅ Datos completos detectados - generando enlace de reserva")
                 final_response = self.generate_summary()
 
             self.conversation_history.append({"role": "assistant", "content": final_response})
@@ -292,8 +348,8 @@ class NaturalAppointmentAgent:
 
         except Exception as e:
             print(f"💥 Error inesperado en send_message: {str(e)}")
-            return "Lo siento, tuve un pequeño error técnico. ¿Podrías repetirme eso con más calma? 😅 Te prometo que lo arreglaré en un segundo."
-
+            return "Lo siento, tuve un pequeño error técnico. ¿Podrías repetirme eso con más calma? 😅"
+        
 # Instancia global
 agent = NaturalAppointmentAgent()
 
@@ -311,64 +367,7 @@ def chat():
 @app.route('/')
 def home():
     return app.send_static_file('index.html')
-
-@app.route('/authorize')
-def authorize():
-    """Inicia el flujo OAuth redirigiendo a Google."""
-    global global_flow
-    
-    # Generar nuevo estado por sesión
-    state = secrets.token_urlsafe(16)
-    
-    # Guardar el estado en la sesión para verificarlo después
-    session['oauth_state'] = state
-    
-    auth_url, global_flow = get_authorization_url(state)
-    
-    return f'''
-    <h2>🔐 Autorización requerida</h2>
-    <p>Haz clic en el enlace para autorizar la app:</p>
-    <a href="{auth_url}" target="_blank">👉 Autorizar con Google</a>
-    '''
-
-@app.route('/callback')
-def callback():
-    """Maneja el callback de Google OAuth."""
-    global global_flow
-
-    # Obtener el estado de la sesión
-    saved_state = session.get('oauth_state')
-    
-    # Verifica estado para prevenir CSRF
-    if request.args.get('state') != saved_state:
-        return "❌ Estado inválido - posible ataque CSRF", 400
-
-    # Limpiar el estado de la sesión después de usarlo
-    session.pop('oauth_state', None)
-
-    # Obtén el código de autorización
-    code = request.args.get('code')
-    if not code:
-        return "❌ No se recibió código de autorización", 400
-
-    try:
-        # Intercambia el código por tokens
-        global_flow.fetch_token(code=code)
-        creds = global_flow.credentials
-
-        # Guarda los tokens en token.json
-        with open('token.json', 'w') as token:
-            token.write(creds.to_json())
-
-        return '''
-        <h2>✅ ¡Autorización exitosa!</h2>
-        <p>Los tokens se han guardado en <code>token.json</code>.</p>
-        <p>Ahora puedes <a href="/">volver al chat</a> y agendar citas.</p>
-        '''
-    except Exception as e:
-        return f"❌ Error al obtener tokens: {str(e)}", 500
     
 if __name__ == '__main__':
-    print("🚀 SecretarioAI - Asistente de citas conversacional")
-    print("👉 Abre http://localhost:5000 en tu navegador")
     app.run(debug=True)
+
