@@ -112,17 +112,16 @@ def get_available_dates_for_therapy(activity_id: int, days_ahead: int = 7) -> di
                 available[formatted_date] = sorted(set(slots_today))
 
         except Exception as e:
-            print(f"⚠️ Error checking date {check_date}: {e}")
+            print(f"Error checking date {check_date}: {e}")
             continue
 
     return available
 
 def clean_llm_response(text: str) -> str:
     """
-    Elimina bloques <think>...</think> del texto generado por el LLM.
-    También elimina cualquier línea que empiece con <think> si no está bien cerrada.
+    Elimina cualquier rastro de <think>... incluso si no está bien cerrado.
+    También elimina texto antes del primer '{' si es necesario.
     """
-    # Elimina bloques completos <think> ... </think>
     text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
     text = re.sub(r'^\s*<think>.*$', '', text, flags=re.MULTILINE)
     text = re.sub(r'\n\s*\n', '\n', text)
@@ -142,23 +141,28 @@ class NaturalAppointmentAgent:
                 "role": "system",
                 "content": (
                     f"Hoy es {today_str}. Eres SecretarioAI, un asistente empático de agendamiento. "
-                    "Tu única tarea es extraer 3 datos del mensaje del usuario y devolverlos en JSON:\n"
-                    "- **terapia**: uno de: Ondas, Fisioterapia, Indiba, Láser, Osteopatía.\n"
-                    "- **fecha**: SIEMPRE en formato dd/mm/yy (ej: 26/09/25). Si el usuario dice 'el 26', '26/09', 'mañana', etc., "
-                    f"usa el contexto de HOY para inferir mes y año. Si la fecha ya pasó, usa el próximo mes o año. "
-                    "NUNCA devuelvas '26/09' sin año. Siempre incluye el año en 2 dígitos.\n"
-                    "- **hora**: SIEMPRE en formato HH:MM con 24h y ceros iniciales (ej: 08:00, 12:45). "
-                    "Si el usuario dice 'a las 8', conviértelo a '08:00'.\n\n"
-                    "IMPORTANTE: Tu respuesta debe ser un JSON EXACTO con este formato:\n"
+                    "Tu tarea es procesar el mensaje del usuario y responder siempre en formato JSON válido.\n\n"
+                    "REGLAS ESTRICAS:\n"
+                    "- NUNCA uses etiquetas como <think>, <reasoning> ni razonamiento interno visible.\n"
+                    "- NUNCA incluyas texto fuera del JSON.\n"
+                    "- Solo devuelve el objeto JSON, nada más.\n\n"
+                    "Formato de salida EXACTO:\n"
                     "{\n"
-                    '  "respuesta": "mensaje amable al usuario",\n'
+                    '  "respuesta": "mensaje amable y natural en español",\n'
                     '  "data": {\n'
                     '    "fecha": "?",\n'
                     '    "hora": "?",\n'
                     '    "terapia": "?"\n'
                     "  }\n"
-                    "}\n"
-                    "Llena los campos que puedas. Usa ? si no hay info. Cuando los 3 estén listos, confirma con alegría."
+                    "}\n\n"
+                    "Instrucciones:\n"
+                    "- terapia: uno de: Ondas, Fisioterapia, Indiba, Láser, Osteopatía.\n"
+                    "- fecha: SIEMPRE dd/mm/yy (ej: 29/09/25).\n"
+                    "- hora: SIEMPRE HH:MM (ej: 08:15).\n"
+                    "- Si falta info, usa '?'.\n"
+                    "- **NUNCA inventes enlaces.**"
+                    "- **NUNCA digas 'Haz clic aquí' ni incluyas URLs.**"
+                    "- Si el usuario necesita el enlace, se lo proporcionaré yo después."
                 )
             }
         ]
@@ -168,136 +172,43 @@ class NaturalAppointmentAgent:
 
     def is_data_complete(self):
         required = ["fecha", "hora", "terapia"]
-        is_complete = all(key in self.user_data for key in required)
-        
-        print(f"Verificando datos completos: {is_complete}")
-        print(f"Datos actuales: {self.user_data}")
-        print(f"Faltantes: {[key for key in required if key not in self.user_data]}")
-    
-        return is_complete
+        return all(key in self.user_data for key in required)
 
     def extract_data_with_llm(self, user_message):
         messages = self.conversation_history + [{"role": "user", "content": user_message}]
-
         try:
-            # Llamada a Groq
             chat_completion = self.client.chat.completions.create(
                 messages=messages,
                 model=self.model,
                 temperature=0.3,
-                max_tokens=512,
+                max_tokens=800,
                 top_p=1,
                 stream=False,
                 stop=None,
                 response_format={"type": "json_object"}
             )
-            
             raw_content = chat_completion.choices[0].message.content
-            cleaned_content = clean_llm_response(raw_content)
-            return cleaned_content
+            return clean_llm_response(raw_content)
         except Exception as e:
-            return f"Lo siento, tuve un problema técnico. ¿Podrías repetirlo, por favor? 😅"
+            print(f"Error en extracción LLM: {e}")
+            return '{"respuesta": "Vaya, tuve un pequeño fallo técnico. ¿Podrías repetirme eso, por favor? 😅", "data": {"fecha": "?", "hora": "?", "terapia": "?"}}'
 
     def update_data_from_llm_response(self, llm_response):
         try:
-            print(f"Respuesta LLM para extracción: {llm_response}")
-            
-            # Limpia la respuesta antes de parsear JSON
-            cleaned_response = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', llm_response)
-            cleaned_response = cleaned_response.strip()
-            
-            # Intenta parsear como JSON
+            cleaned_response = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', llm_response).strip()
             data = json.loads(cleaned_response)
-            print(f"JSON parseado: {data}")
-            
-            # Extrae datos si están presentes
             if 'data' in data and isinstance(data['data'], dict):
-                user_data = data['data']
-                print(f"Datos extraídos: {user_data}")
-                
                 for key in ["fecha", "hora", "terapia"]:
-                    if key in user_data and user_data[key] and user_data[key] != "?":
-                        self.user_data[key] = str(user_data[key]).strip()
-                        print(f"Guardado {key}: {user_data[key]}")
-                    
-        except json.JSONDecodeError as e:
-            print(f"No se pudo decodificar JSON: {e}")
-            print(f"Contenido que falló: {llm_response}")
+                    val = data['data'].get(key)
+                    if val and val != "?":
+                        self.user_data[key] = str(val).strip()
         except Exception as e:
-            print(f"Error en update_data: {e}")
-
-    def generate_summary(self):
-        print(f"GENERATE_SUMMARY llamado con datos: {self.user_data}")
-        
-        if not self.is_data_complete():
-            return "Error: Datos incompletos para generar resumen"
-        
-        data = self.user_data
-
-        # Mapeo de terapias
-        THERAPY_TO_ACTIVITY_ID = {
-            "ondas": 94797,
-            "fisioterapia": 72574,
-            "indiba": 72573,
-            "láser": 94798,
-            "osteopatía": 72576,
-        }
-
-        terapia = data['terapia'].lower().strip()
-        activity_id = THERAPY_TO_ACTIVITY_ID.get(terapia)
-
-        if not activity_id:
-            return f"Lo siento, no ofrecemos '{data['terapia']}' en este centro. ¿Te gustaría probar con Ondas, Fisioterapia, Indiba, Láser u Osteopatía? 😊"
-
-        # Convertir fecha al formato YYYY-MM-DD
-        try:
-            fecha_dt = datetime.strptime(data['fecha'], "%d/%m/%y")
-            fecha_iso = fecha_dt.strftime("%Y-%m-%d")
-            hora_str = data['hora']
-            
-            if ':' in hora_str:
-                h, m = hora_str.split(':')
-                hora_str = f"{int(h):02d}:{int(m):02d}"
-            else:
-                hora_str = f"{int(hora_str):02d}:00"
-                
-        except Exception as e:
-            print(f"Error al parsear fecha/hora: {e}")
-            return (
-                "❌ Ups, no pude entender bien la fecha u hora. "
-                "¿Podrías decírmelo como '26/04/25 a las 08:00'? 😊"
-            )
-
-        # Buscar slot disponible
-        slot_id = find_timp_slot(activity_id, fecha_iso, hora_str)
-
-        if not slot_id:
-            return (
-                f"Lo siento, no hay disponibilidad para {data['terapia']} el {data['fecha']} a las {data['hora']}.\n"
-                "¿Te gustaría probar con otra hora o fecha? 😊"
-            )
-
-        #construir el mensaje final
-        BRANCH_BUILDING_ID = "11269"
-        cita_url = f"https://web.timp.pro/home/{BRANCH_BUILDING_ID}#/home/{BRANCH_BUILDING_ID}/branch_building/admissions/{slot_id}"
-
-        # Construir el resumen completo
-        summary = (
-            f"¡Disponibilidad encontrada! 🎉\n\n"
-            f"Fecha: {data['fecha']} a las {data['hora']}\n"
-            f"Terapia: {data['terapia']}\n\n"
-            f"**¡Listo! Haz clic aquí para reservar tu cita directamente**:\n"
-            f"{cita_url}\n\n"
-            f"Solo te tomará unos segundos. ¡Te esperamos!"
-        )
-
-        return summary
+            print(f"Error al actualizar datos: {e}")
 
     def send_message(self, user_message: str) -> str:
         try:
-            # Si es el primer mensaje del usuario (historial solo tiene system)
+            # Primer mensaje: bienvenida
             is_first_message = len(self.conversation_history) == 1
-
             if is_first_message:
                 response_text = (
                     "¡Hola! 👋 Soy tu asistente de agendamiento.\n\n"
@@ -310,75 +221,122 @@ class NaturalAppointmentAgent:
                     "• Osteopatía\n\n"
                     "¡Elige una y te muestro las próximas fechas con disponibilidad!"
                 )
-                self.conversation_history.append({"role": "user", "content": user_message})
-                self.conversation_history.append({"role": "assistant", "content": response_text})
+                self.conversation_history.extend([
+                    {"role": "user", "content": user_message},
+                    {"role": "assistant", "content": response_text}
+                ])
                 return response_text
+
+            # Mapeo de terapias
+            THERAPY_TO_ACTIVITY_ID = {
+                "ondas": 94797,
+                "fisioterapia": 72574,
+                "indiba": 72573,
+                "láser": 94798,
+                "osteopatía": 72576,
+            }
 
             # Añadir mensaje del usuario al historial
             self.conversation_history.append({"role": "user", "content": user_message})
 
-            # Obtener respuesta del LLM
+            # Paso 1: Extraer datos del mensaje actual
             llm_response = self.extract_data_with_llm(user_message)
-            print(f"🤖 RESPUESTA CRUDA DE GROQ: {llm_response}")
-
-            # Extraer datos estructurados
             self.update_data_from_llm_response(llm_response)
 
-            # Intentar extraer 'respuesta' del JSON del LLM
-            try:
-                response_data = json.loads(llm_response)
-                final_response = response_data.get("respuesta", "Gracias por la información. ¿Hay algo más en lo que pueda ayudarte? 😊")
-            except json.JSONDecodeError:
-                final_response = "Gracias por tu mensaje. Déjame ayudarte 😊"
+            # Paso 2: Preparar contexto adicional si es relevante
+            enriched_message = user_message
 
-            #Si el usuario dio terapia pero no fecha/hora → mostrar disponibilidad (máx. 2 días, 3-5 horas)
+            # ¿Tenemos terapia, pero no fecha/hora? → Añadir disponibilidad
             if "terapia" in self.user_data and "fecha" not in self.user_data and "hora" not in self.user_data:
                 terapia = self.user_data["terapia"].lower().strip()
-                THERAPY_TO_ACTIVITY_ID = {
-                    "ondas": 94797,
-                    "fisioterapia": 72574,
-                    "indiba": 72573,
-                    "láser": 94798,
-                    "osteopatía": 72576,
-                }
                 activity_id = THERAPY_TO_ACTIVITY_ID.get(terapia)
-
                 if activity_id:
-                    available_dates = get_available_dates_for_therapy(activity_id, days_ahead=7)
-                    if available_dates:
-                        # Tomar solo los primeros 2 días
-                        limited_dates = list(available_dates.items())[:2]
-                        disponibilidad_lines = []
-                        for fecha, horas in limited_dates:
-                            # Tomar hasta 5 horas
-                            horas_limited = horas[:5]
-                            disponibilidad_lines.append(f"📅 **{fecha}** → {', '.join(horas_limited)}")
-                        disponibilidad = "\n".join(disponibilidad_lines)
-
-                        final_response = (
-                            f"¡Genial elección! *{terapia.title()}* es una excelente opción.\n\n"
-                            f"Estas son las próximas fechas con disponibilidad:\n\n"
-                            f"{disponibilidad}\n\n"
-                            "¿Qué fecha y hora te gustaría reservar? Puedes decirme algo como:\n"
-                            "“El 10/04 a las 17:00” o “Mañana a las 9:00”"
-                        )
+                    available = get_available_dates_for_therapy(activity_id, days_ahead=3)
+                    if available:
+                        disp_lines = [f"{fecha}: {', '.join(horas[:3])}" for fecha, horas in list(available.items())[:2]]
+                        enriched_message += f" [DISPONIBILIDAD_ACTUAL: {'; '.join(disp_lines)}]"
                     else:
-                        final_response = f"Lo siento, no hay disponibilidad para {terapia} en los próximos días. ¿Quieres que revise más adelante o probar con otra terapia? 🤔"
-                else:
-                    final_response = f"❌ No tengo configurada la terapia '{terapia}'. ¿Puedes elegir entre: Ondas, Fisioterapia, Indiba, Láser u Osteopatía? 😊"
+                        enriched_message += " [DISPONIBILIDAD_ACTUAL: no hay citas en los próximos 3 días]"
 
-            # Si los 3 datos están completos → generar enlace
+            # ¿Tenemos los 3 datos? → Verificar disponibilidad real
             elif self.is_data_complete():
-                print("✅ Datos completos detectados - generando enlace de reserva")
-                final_response = self.generate_summary()
+                data = self.user_data
+                terapia = data['terapia'].lower().strip()
+                activity_id = THERAPY_TO_ACTIVITY_ID.get(terapia)
+                if activity_id:
+                    try:
+                        fecha_dt = datetime.strptime(data['fecha'], "%d/%m/%y")
+                        fecha_iso = fecha_dt.strftime("%Y-%m-%d")
+                        hora_str = data['hora']
+                        if ':' in hora_str:
+                            h, m = hora_str.split(':')
+                            hora_str = f"{int(h):02d}:{int(m):02d}"
+                        else:
+                            hora_str = f"{int(hora_str):02d}:00"
 
-            # Añadir respuesta del asistente al historial
+                        slot_id = find_timp_slot(activity_id, fecha_iso, hora_str)
+                        if slot_id:
+                            enriched_message += " [CONFIRMACIÓN_CITA: disponible]"
+                        else:
+                            enriched_message += " [ERROR_CITA: no hay disponibilidad en esa fecha/hora]"
+                    except Exception as e:
+                        enriched_message += " [ERROR_CITA: formato de fecha u hora inválido]"
+                else:
+                    enriched_message += " [ERROR_CITA: terapia no disponible]"
+
+            # Paso 3: Generar respuesta final usando el mensaje enriquecido
+            final_llm_response = self.extract_data_with_llm(enriched_message)
+            self.update_data_from_llm_response(final_llm_response)
+
+            try:
+                response_data = json.loads(final_llm_response)
+                final_response = response_data.get("respuesta", "¿Podrías repetirlo, por favor? 😊")
+            except json.JSONDecodeError:
+                final_response = "Vaya, tuve un fallo técnico. ¿Me lo dices de nuevo? 😅"
+
+            THERAPY_TO_ACTIVITY_ID = {
+                "ondas": 94797,
+                "fisioterapia": 72574,
+                "indiba": 72573,
+                "láser": 94798,
+                "osteopatía": 72576,
+            }
+
+            slot_id_for_response = None
+            if self.is_data_complete():
+                data = self.user_data
+                terapia = data['terapia'].lower().strip()
+                activity_id = THERAPY_TO_ACTIVITY_ID.get(terapia)
+                if activity_id:
+                    try:
+                        fecha_dt = datetime.strptime(data['fecha'], "%d/%m/%y")
+                        fecha_iso = fecha_dt.strftime("%Y-%m-%d")
+                        hora_str = data['hora']
+                        if ':' in hora_str:
+                            h, m = hora_str.split(':')
+                            hora_str = f"{int(h):02d}:{int(m):02d}"
+                        else:
+                            hora_str = f"{int(hora_str):02d}:00"
+                        slot_id_for_response = find_timp_slot(activity_id, fecha_iso, hora_str)
+                    except Exception as e:
+                        print(f"Error al verificar disponibilidad final: {e}")
+                        slot_id_for_response = None
+
+            # Si hay slot_id real, añadir enlace al final del mensaje
+            if slot_id_for_response:
+                BRANCH_BUILDING_ID = "11269"
+                cita_url = f"https://web.timp.pro/home/{BRANCH_BUILDING_ID}#/home/{BRANCH_BUILDING_ID}/branch_building/admissions/{slot_id_for_response}"
+                final_response = final_response.rstrip(" .") + f"\n\n✅ **¡Listo!** Haz clic aquí para confirmar tu cita: {cita_url}"
+
             self.conversation_history.append({"role": "assistant", "content": final_response})
             return final_response
 
+
         except Exception as e:
             print(f"Error inesperado en send_message: {str(e)}")
-            return "Lo siento, tuve un pequeño error técnico. ¿Podrías repetirme eso con más calma? 😅"    
+            fallback = "Vaya, tuve un pequeño fallo técnico. ¿Podrías repetirme eso, por favor? 😅"
+            self.conversation_history.append({"role": "assistant", "content": fallback})
+            return fallback
 
 # Instancia global
 agent = NaturalAppointmentAgent()
