@@ -322,11 +322,15 @@ class NaturalAppointmentAgent:
                         print(f"Error al verificar disponibilidad final: {e}")
                         slot_id_for_response = None
 
-            # Si hay slot_id real, añadir enlace al final del mensaje
+                        # Si hay slot_id real, añadir enlace al final del mensaje
             if slot_id_for_response:
                 BRANCH_BUILDING_ID = "11269"
                 cita_url = f"https://web.timp.pro/home/{BRANCH_BUILDING_ID}#/home/{BRANCH_BUILDING_ID}/branch_building/admissions/{slot_id_for_response}"
                 final_response = final_response.rstrip(" .") + f"\n\n✅ **¡Listo!** Haz clic aquí para confirmar tu cita: {cita_url}"
+                
+                # Nueva cita
+                self.user_data = {}
+                final_response += "\n\n¿Te gustaría agendar otra cita o necesitas ayuda con algo más? 😊"
 
             self.conversation_history.append({"role": "assistant", "content": final_response})
             return final_response
