@@ -129,8 +129,45 @@ def clean_llm_response(text: str) -> str:
 
     return text
 
+THERAPY_OPTIONS = {
+    "ondas": {
+        "first_visit": {"id": 109996, "name": "Primera Visita Ondas"},
+        "options": [
+            {"id": 109998, "name": "Tratamiento Ondas Focales"},
+            {"id": 109999, "name": "Tratamiento Ondas Radiales"}
+        ]
+    },
+    "fisioterapia": {
+        "first_visit": {"id": 72648, "name": "Fisioterapia 1ª visita"},
+        "options": [
+            {"id": 72574, "name": "Fisioterapia"},
+            {"id": 96265, "name": "Fisio+Indiba+Láser"}
+        ]
+    },
+    "indiba": {
+        "first_visit": None,
+        "options": [
+            {"id": 72573, "name": "Indiba 45'"},
+            {"id": 97822, "name": "Indiba + Láser"}
+        ]
+    },
+    "láser": {
+        "first_visit": None,
+        "options": [
+            {"id": 94798, "name": "Láser"},
+            {"id": 110000, "name": "Tratamiento Laser"}
+        ]
+    },
+    "osteopatía": {
+        "first_visit": {"id": 72651, "name": "Osteopatia 1ª visita"},
+        "options": [
+            {"id": 72576, "name": "Osteopatia"}
+        ]
+    }
+}
+
 class NaturalAppointmentAgent:
-    def __init__(self, model_name="qwen/qwen3-32b"):
+    def __init__(self, model_name="llama-3.1-8b-instant"):
         self.model = model_name
         self.user_data = {}
         today = datetime.now()
@@ -147,22 +184,22 @@ class NaturalAppointmentAgent:
                     "- NUNCA incluyas texto fuera del JSON.\n"
                     "- Solo devuelve el objeto JSON, nada más.\n\n"
                     "Formato de salida EXACTO:\n"
-                    "{\n"
+                    '{\n'
                     '  "respuesta": "mensaje amable y natural en español",\n'
                     '  "data": {\n'
+                    '    "terapia": "?",\n'
+                    '    "subopcion": "?",\n'
                     '    "fecha": "?",\n'
-                    '    "hora": "?",\n'
-                    '    "terapia": "?"\n'
-                    "  }\n"
-                    "}\n\n"
+                    '    "hora": "?"\n'
+                    '  }\n'
+                    '}\n\n'
                     "Instrucciones:\n"
                     "- terapia: uno de: Ondas, Fisioterapia, Indiba, Láser, Osteopatía.\n"
+                    "- subopcion: el nombre exacto de la opción elegida (ej: \"Fisioterapia\", \"Primera Visita Ondas\").\n"
                     "- fecha: SIEMPRE dd/mm/yy (ej: 29/09/25).\n"
                     "- hora: SIEMPRE HH:MM (ej: 08:15).\n"
-                    "- Si falta info, usa '?'.\n"
-                    "- **NUNCA inventes enlaces.**"
-                    "- **NUNCA digas 'Haz clic aquí' ni incluyas URLs.**"
-                    "- Si el usuario necesita el enlace, se lo proporcionaré yo después."
+                    "- Si falta información, usa '?'.\n"
+                    "- **NUNCA inventes enlaces.**\n"
                 )
             }
         ]
@@ -206,141 +243,144 @@ class NaturalAppointmentAgent:
             print(f"Error al actualizar datos: {e}")
 
     def send_message(self, user_message: str) -> str:
-        try:
-            # Primer mensaje: bienvenida
-            is_first_message = len(self.conversation_history) == 1
-            if is_first_message:
-                response_text = (
-                    "¡Hola! 👋 Soy tu asistente de agendamiento.\n\n"
-                    "¿Qué tipo de terapia te gustaría reservar hoy?\n\n"
-                    "Tenemos disponibles:\n"
-                    "• Ondas\n"
-                    "• Fisioterapia\n"
-                    "• Indiba\n"
-                    "• Láser\n"
-                    "• Osteopatía\n\n"
-                    "¡Elige una y te muestro las próximas fechas con disponibilidad!"
-                )
-                self.conversation_history.extend([
-                    {"role": "user", "content": user_message},
-                    {"role": "assistant", "content": response_text}
-                ])
-                return response_text
-
-            # Mapeo de terapias
-            THERAPY_TO_ACTIVITY_ID = {
-                "ondas": 94797,
-                "fisioterapia": 72574,
-                "indiba": 72573,
-                "láser": 94798,
-                "osteopatía": 72576,
-            }
-
-            # Añadir mensaje del usuario al historial
+        # Bienvenida inicial
+        if len(self.conversation_history) == 1:
             self.conversation_history.append({"role": "user", "content": user_message})
+            response_text = (
+                "¡Hola! 👋 Soy tu asistente de agendamiento.\n\n"
+                "¿Qué tipo de terapia te gustaría reservar?\n\n"
+                "• Ondas\n• Fisioterapia\n• Indiba\n• Láser\n• Osteopatía"
+            )
+            self.conversation_history.append({"role": "assistant", "content": response_text})
+            return response_text
 
-            # Paso 1: Extraer datos del mensaje actual
-            llm_response = self.extract_data_with_llm(user_message)
-            self.update_data_from_llm_response(llm_response)
+        self.conversation_history.append({"role": "user", "content": user_message})
 
-            # Paso 2: Preparar contexto adicional si es relevante
-            enriched_message = user_message
-
-            # ¿Tenemos terapia, pero no fecha/hora? → Añadir disponibilidad
-            if "terapia" in self.user_data and "fecha" not in self.user_data and "hora" not in self.user_data:
-                terapia = self.user_data["terapia"].lower().strip()
-                activity_id = THERAPY_TO_ACTIVITY_ID.get(terapia)
-                if activity_id:
-                    available = get_available_dates_for_therapy(activity_id, days_ahead=3)
-                    if available:
-                        disp_lines = [f"{fecha}: {', '.join(horas[:3])}" for fecha, horas in list(available.items())[:2]]
-                        enriched_message += f" [DISPONIBILIDAD_ACTUAL: {'; '.join(disp_lines)}]"
-                    else:
-                        enriched_message += " [DISPONIBILIDAD_ACTUAL: no hay citas en los próximos 3 días]"
-
-            # ¿Tenemos los 3 datos? → Verificar disponibilidad real
-            elif self.is_data_complete():
-                data = self.user_data
-                terapia = data['terapia'].lower().strip()
-                activity_id = THERAPY_TO_ACTIVITY_ID.get(terapia)
-                if activity_id:
-                    try:
-                        fecha_dt = datetime.strptime(data['fecha'], "%d/%m/%y")
-                        fecha_iso = fecha_dt.strftime("%Y-%m-%d")
-                        hora_str = data['hora']
-                        if ':' in hora_str:
-                            h, m = hora_str.split(':')
-                            hora_str = f"{int(h):02d}:{int(m):02d}"
-                        else:
-                            hora_str = f"{int(hora_str):02d}:00"
-
-                        slot_id = find_timp_slot(activity_id, fecha_iso, hora_str)
-                        if slot_id:
-                            enriched_message += " [CONFIRMACIÓN_CITA: disponible]"
-                        else:
-                            enriched_message += " [ERROR_CITA: no hay disponibilidad en esa fecha/hora]"
-                    except Exception as e:
-                        enriched_message += " [ERROR_CITA: formato de fecha u hora inválido]"
-                else:
-                    enriched_message += " [ERROR_CITA: terapia no disponible]"
-
-            # Paso 3: Generar respuesta final usando el mensaje enriquecido
-            final_llm_response = self.extract_data_with_llm(enriched_message)
-            self.update_data_from_llm_response(final_llm_response)
-
-            try:
-                response_data = json.loads(final_llm_response)
-                final_response = response_data.get("respuesta", "¿Podrías repetirlo, por favor? 😊")
-            except json.JSONDecodeError:
-                final_response = "Vaya, tuve un fallo técnico. ¿Me lo dices de nuevo? 😅"
-
-            THERAPY_TO_ACTIVITY_ID = {
-                "ondas": 94797,
-                "fisioterapia": 72574,
-                "indiba": 72573,
-                "láser": 94798,
-                "osteopatía": 72576,
-            }
-
-            slot_id_for_response = None
-            if self.is_data_complete():
-                data = self.user_data
-                terapia = data['terapia'].lower().strip()
-                activity_id = THERAPY_TO_ACTIVITY_ID.get(terapia)
-                if activity_id:
-                    try:
-                        fecha_dt = datetime.strptime(data['fecha'], "%d/%m/%y")
-                        fecha_iso = fecha_dt.strftime("%Y-%m-%d")
-                        hora_str = data['hora']
-                        if ':' in hora_str:
-                            h, m = hora_str.split(':')
-                            hora_str = f"{int(h):02d}:{int(m):02d}"
-                        else:
-                            hora_str = f"{int(hora_str):02d}:00"
-                        slot_id_for_response = find_timp_slot(activity_id, fecha_iso, hora_str)
-                    except Exception as e:
-                        print(f"Error al verificar disponibilidad final: {e}")
-                        slot_id_for_response = None
-
-                        # Si hay slot_id real, añadir enlace al final del mensaje
-            if slot_id_for_response:
-                BRANCH_BUILDING_ID = "11269"
-                cita_url = f"https://web.timp.pro/home/{BRANCH_BUILDING_ID}#/home/{BRANCH_BUILDING_ID}/branch_building/admissions/{slot_id_for_response}"
-                final_response = final_response.rstrip(" .") + f"\n\n✅ **¡Listo!** Haz clic aquí para confirmar tu cita: {cita_url}"
-                
-                # Nueva cita
-                self.user_data = {}
-                final_response += "\n\n¿Te gustaría agendar otra cita o necesitas ayuda con algo más? 😊"
-
-            self.conversation_history.append({"role": "assistant", "content": final_response})
-            return final_response
-
-
+        # Extraer datos del LLM
+        llm_response = self.extract_data_with_llm(user_message)
+        try:
+            parsed = json.loads(clean_llm_response(llm_response))
+            data = parsed.get("data", {})
+            reply = parsed.get("respuesta", "¿Podrías repetirlo?")
         except Exception as e:
-            print(f"Error inesperado en send_message: {str(e)}")
-            fallback = "Vaya, tuve un pequeño fallo técnico. ¿Podrías repetirme eso, por favor? 😅"
-            self.conversation_history.append({"role": "assistant", "content": fallback})
-            return fallback
+            return "Vaya, tuve un fallo técnico. ¿Me lo dices de nuevo? 😅"
+
+        # Actualizar solo campos válidos
+        for key in ["terapia", "subopcion", "fecha", "hora"]:
+            val = data.get(key)
+            if val and val != "?":
+                self.user_data[key] = val.strip()
+
+        terapia = self.user_data.get("terapia", "").lower()
+        subopcion = self.user_data.get("subopcion")
+
+        # --- Paso 1: Terapia seleccionada, pero sin subopción → mostrar subopciones ---
+        if terapia and not subopcion:
+            if terapia not in THERAPY_OPTIONS:
+                self.user_data.pop("terapia", None)
+                return "No ofrecemos esa terapia. Por favor, elige entre: Ondas, Fisioterapia, Indiba, Láser u Osteopatía."
+
+            config = THERAPY_OPTIONS[terapia]
+            choices = []
+            if config["first_visit"]:
+                choices.append(config["first_visit"]["name"])
+            for opt in config["options"]:
+                choices.append(opt["name"])
+
+            msg = f"Elige una opción para **{terapia.capitalize()}**:\n" + "\n".join(f"• {c}" for c in choices)
+            self.conversation_history.append({"role": "assistant", "content": msg})
+            return msg
+
+        # --- Paso 2: Subopción seleccionada, pero sin fecha → mostrar disponibilidad ---
+        if terapia and subopcion and "fecha" not in self.user_data:
+            # Buscar activity_id por nombre exacto de subopción
+            activity_id = None
+            config = THERAPY_OPTIONS.get(terapia)
+            if config:
+                if config["first_visit"] and config["first_visit"]["name"] == subopcion:
+                    activity_id = config["first_visit"]["id"]
+                else:
+                    for opt in config["options"]:
+                        if opt["name"] == subopcion:
+                            activity_id = opt["id"]
+                            break
+
+            if not activity_id:
+                # Si no coincide, limpiar y pedir de nuevo
+                self.user_data.pop("subopcion", None)
+                return "Opción no reconocida. Por favor, elige una de las listadas."
+
+            # Obtener disponibilidad (3 días con al menos 4 horarios)
+            available = get_available_dates_for_therapy(activity_id, days_ahead=7)
+            filtered = {}
+            for date_str, times in available.items():
+                if len(times) >= 4 and len(filtered) < 3:
+                    filtered[date_str] = times[:6]  # hasta 6 horarios
+
+            if not filtered:
+                self.user_data.pop("subopcion", None)
+                return "Lo siento, no hay disponibilidad en los próximos días. ¿Quieres intentar con otra opción?"
+
+            lines = [f"• **{date}**: {', '.join(times)}" for date, times in filtered.items()]
+            msg = "Elige una fecha y hora (responde con '18/10 a las 09:15', por ejemplo):\n" + "\n".join(lines)
+            self.conversation_history.append({"role": "assistant", "content": msg})
+            return msg
+
+        # --- Paso 3: Fecha y hora seleccionadas → generar enlace ---
+        if terapia and subopcion and self.user_data.get("fecha") and self.user_data.get("hora"):
+            # Buscar activity_id (igual que arriba)
+            activity_id = None
+            config = THERAPY_OPTIONS.get(terapia)
+            if config:
+                if config["first_visit"] and config["first_visit"]["name"] == subopcion:
+                    activity_id = config["first_visit"]["id"]
+                else:
+                    for opt in config["options"]:
+                        if opt["name"] == subopcion:
+                            activity_id = opt["id"]
+                            break
+
+            if not activity_id:
+                return "Error: opción no válida."
+
+            # Parsear fecha
+            fecha_str = self.user_data["fecha"]
+            try:
+                if len(fecha_str.split("/")[2]) == 2:
+                    fecha_dt = datetime.strptime(fecha_str, "%d/%m/%y")
+                else:
+                    fecha_dt = datetime.strptime(fecha_str, "%d/%m/%Y")
+                fecha_iso = fecha_dt.strftime("%Y-%m-%d")
+            except:
+                return "Formato de fecha inválido. Usa dd/mm/yy."
+
+            # Parsear hora
+            hora_str = self.user_data["hora"]
+            try:
+                if ':' in hora_str:
+                    h, m = hora_str.split(':')
+                    hora_norm = f"{int(h):02d}:{int(m):02d}"
+                else:
+                    hora_norm = f"{int(hora_str):02d}:00"
+            except:
+                return "Formato de hora inválido. Usa HH:MM."
+
+            # Verificar disponibilidad real
+            slot_id = find_timp_slot(activity_id, fecha_iso, hora_norm)
+            if not slot_id:
+                return "Ese horario ya no está disponible. Por favor, elige otro."
+
+            # Generar enlace
+            BRANCH_BUILDING_ID = "11269"
+            cita_url = f"https://web.timp.pro/home/{BRANCH_BUILDING_ID}#/home/{BRANCH_BUILDING_ID}/branch_building/admissions/{slot_id}"
+            msg = f"✅ **¡Listo!** Confirma tu cita aquí: {cita_url}\n\n¿Quieres agendar otra?"
+            self.user_data = {}  # Reiniciar
+            self.conversation_history.append({"role": "assistant", "content": msg})
+            return msg
+
+        # Por defecto: responder con el mensaje del LLM (raro que ocurra)
+        self.conversation_history.append({"role": "assistant", "content": reply})
+        return reply
 
 # Instancia global
 agent = NaturalAppointmentAgent()

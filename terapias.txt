@@ -1,0 +1,36 @@
+THERAPY_OPTIONS = {
+    "ondas": {
+        "first_visit": {"id": 109996, "name": "Primera Visita Ondas"},
+        "options": [
+            {"id": 109998, "name": "Tratamiento Ondas Focales"},
+            {"id": 109999, "name": "Tratamiento Ondas Radiales"}
+        ]
+    },
+    "fisioterapia": {
+        "first_visit": {"id": 72648, "name": "Fisioterapia 1ª visita"},
+        "options": [
+            {"id": 72574, "name": "Fisioterapia"},
+            {"id": 96265, "name": "Fisio+Indiba+Láser"}
+        ]
+    },
+    "indiba": {
+        "first_visit": None,
+        "options": [
+            {"id": 72573, "name": "Indiba 45'"},
+            {"id": 97822, "name": "Indiba + Láser"}
+        ]
+    },
+    "láser": {
+        "first_visit": None,
+        "options": [
+            {"id": 94798, "name": "Láser"},
+            {"id": 110000, "name": "Tratamiento Laser"}
+        ]
+    },
+    "osteopatía": {
+        "first_visit": {"id": 72651, "name": "Osteopatia 1ª visita"},
+        "options": [
+            {"id": 72576, "name": "Osteopatia"}
+        ]
+    }
+}
