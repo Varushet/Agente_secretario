@@ -7,6 +7,9 @@ import re
 import secrets
 from groq import Groq
 from dotenv import load_dotenv
+from dateparser import parse
+from datetime import datetime, time
+
 
 load_dotenv()
 
@@ -129,6 +132,45 @@ def clean_llm_response(text: str) -> str:
 
     return text
 
+def normalize_dates_in_message(text: str) -> str:
+    """
+    Busca expresiones de fecha/hora en lenguaje natural y las reemplaza
+    por formato estándar: 'dd/mm/yy a las HH:MM'.
+    """
+    # Lista de patrones comunes (puedes ampliarla)
+    import re
+    today = datetime.now().date()
+    parsed = parse(
+        text,
+        languages=['es'],
+        settings={
+            'PREFER_DATES_FROM': 'future',
+            'RELATIVE_BASE': datetime.combine(today, time(12, 0)),  # base al mediodía
+            'TIMEZONE': 'Europe/Madrid'
+        }
+    )
+
+    if parsed and parsed.date() != today:
+        # Asumimos que el usuario se refiere a esa fecha
+        fecha_str = parsed.strftime("%d/%m/%y")
+        hora_str = parsed.strftime("%H:%M") if parsed.time() != time(0, 0) else None
+
+        # Si no especificó hora, asumimos ventana (mañana/tarde)
+        if not hora_str:
+            if "mañana" in text.lower() or "tarde" in text.lower():
+                hora_str = "17:00"
+            elif "mañana" in text.lower():  # "mañana por la mañana"
+                hora_str = "10:00"
+            elif "mediodía" in text.lower():
+                hora_str = "13:00"
+            else:
+                hora_str = "10:00"
+
+        return f"{fecha_str} a las {hora_str}"
+
+    # Si no se detecta fecha clara, devolver el texto original
+    return text
+
 THERAPY_OPTIONS = {
     "ondas": {
         "first_visit": {"id": 109996, "name": "Primera Visita Ondas"},
@@ -200,6 +242,7 @@ class NaturalAppointmentAgent:
                     "- hora: SIEMPRE HH:MM (ej: 08:15).\n"
                     "- Si falta información, usa '?'.\n"
                     "- **NUNCA inventes enlaces.**\n"
+                    "Si el usuario solo dice la terapia, **debes pedir la subopción** en 'respuesta', y dejar 'subopcion' como '?'."
                 )
             }
         ]
@@ -243,9 +286,13 @@ class NaturalAppointmentAgent:
             print(f"Error al actualizar datos: {e}")
 
     def send_message(self, user_message: str) -> str:
+        normalized_message = normalize_dates_in_message(user_message)
+        print(f"[DEBUG] Mensaje original: {user_message}")
+        print(f"[DEBUG] Mensaje normalizado: {normalized_message}")
+
         # Bienvenida inicial
         if len(self.conversation_history) == 1:
-            self.conversation_history.append({"role": "user", "content": user_message})
+            self.conversation_history.append({"role": "user", "content": normalized_message})
             response_text = (
                 "¡Hola! 👋 Soy tu asistente de agendamiento.\n\n"
                 "¿Qué tipo de terapia te gustaría reservar?\n\n"
@@ -254,10 +301,11 @@ class NaturalAppointmentAgent:
             self.conversation_history.append({"role": "assistant", "content": response_text})
             return response_text
 
-        self.conversation_history.append({"role": "user", "content": user_message})
+        # Añadir mensaje normalizado al historial
+        self.conversation_history.append({"role": "user", "content": normalized_message})
 
         # Extraer datos del LLM
-        llm_response = self.extract_data_with_llm(user_message)
+        llm_response = self.extract_data_with_llm(normalized_message)
         try:
             parsed = json.loads(clean_llm_response(llm_response))
             data = parsed.get("data", {})
@@ -292,7 +340,7 @@ class NaturalAppointmentAgent:
             return msg
 
         # --- Paso 2: Subopción seleccionada, pero sin fecha → mostrar disponibilidad ---
-        if terapia and subopcion and "fecha" not in self.user_data:
+        elif terapia and subopcion and "fecha" not in self.user_data:
             # Buscar activity_id por nombre exacto de subopción
             activity_id = None
             config = THERAPY_OPTIONS.get(terapia)
@@ -327,7 +375,7 @@ class NaturalAppointmentAgent:
             return msg
 
         # --- Paso 3: Fecha y hora seleccionadas → generar enlace ---
-        if terapia and subopcion and self.user_data.get("fecha") and self.user_data.get("hora"):
+        elif terapia and subopcion and self.user_data.get("fecha") and self.user_data.get("hora"):
             # Buscar activity_id (igual que arriba)
             activity_id = None
             config = THERAPY_OPTIONS.get(terapia)
@@ -351,7 +399,8 @@ class NaturalAppointmentAgent:
                 else:
                     fecha_dt = datetime.strptime(fecha_str, "%d/%m/%Y")
                 fecha_iso = fecha_dt.strftime("%Y-%m-%d")
-            except:
+            except Exception as e:
+                print(f"[ERROR] Fecha inválida: {e}")
                 return "Formato de fecha inválido. Usa dd/mm/yy."
 
             # Parsear hora
@@ -362,26 +411,26 @@ class NaturalAppointmentAgent:
                     hora_norm = f"{int(h):02d}:{int(m):02d}"
                 else:
                     hora_norm = f"{int(hora_str):02d}:00"
-            except:
+            except Exception as e:
+                print(f"[ERROR] Hora inválida: {e}")
                 return "Formato de hora inválido. Usa HH:MM."
 
-            # Verificar disponibilidad real
-            slot_id = find_timp_slot(activity_id, fecha_iso, hora_norm)
-            if not slot_id:
+            # 🔑 Verificar disponibilidad real → ¡aquí estaba el error!
+            slot_id_for_response = find_timp_slot(activity_id, fecha_iso, hora_norm)
+            if not slot_id_for_response:
                 return "Ese horario ya no está disponible. Por favor, elige otro."
 
-            # Generar enlace
+            # ✅ Generar enlace (¡URL corregida!)
             BRANCH_BUILDING_ID = "11269"
-            cita_url = f"https://web.timp.pro/home/{BRANCH_BUILDING_ID}#/home/{BRANCH_BUILDING_ID}/branch_building/admissions/{slot_id}"
-            msg = f"✅ **¡Listo!** Confirma tu cita aquí: {cita_url}\n\n¿Quieres agendar otra?"
-            self.user_data = {}  # Reiniciar
+            cita_url = f"https://web.timp.pro/home/{BRANCH_BUILDING_ID}#/home/{BRANCH_BUILDING_ID}/branch_building/admissions/{slot_id_for_response}"
+            print(f"[DEBUG] ✅ Generando enlace: {cita_url}")
+            msg = f"✅ **¡Listo!** Haz clic aquí para confirmar tu cita: {cita_url}\n\n¿Te gustaría agendar otra cita o necesitas ayuda con algo más? 😊"
+
+            # Reiniciar estado
+            self.user_data = {}
             self.conversation_history.append({"role": "assistant", "content": msg})
             return msg
-
-        # Por defecto: responder con el mensaje del LLM (raro que ocurra)
-        self.conversation_history.append({"role": "assistant", "content": reply})
-        return reply
-
+        
 # Instancia global
 agent = NaturalAppointmentAgent()
 
