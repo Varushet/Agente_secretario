@@ -69,7 +69,11 @@ def find_timp_slot(activity_id: int, date: str, time: str) -> str | None:
         print(f"Excepción al buscar slot: {str(e)}")
         return None
 
-def get_available_dates_for_therapy(activity_id: int, days_ahead: int = 7) -> dict:
+def get_available_dates_for_therapy(
+    activity_id: int, 
+    start_offset: int = 0, 
+    end_offset: int = 6
+) -> dict:
     available = {}
     headers = {
         'accept': 'application/timp.user-app-v2',
@@ -91,7 +95,9 @@ def get_available_dates_for_therapy(activity_id: int, days_ahead: int = 7) -> di
     }
 
     today = datetime.today()
-    for i in range(days_ahead):
+    for i in range(start_offset, end_offset + 1):
+        if i < 0:
+            continue
         check_date = (today + timedelta(days=i)).strftime("%Y-%m-%d")
         url = f"https://panel.timp.pro/api/user_app/v2/activities/{activity_id}/admissions"
         params = {'date': check_date}
@@ -132,44 +138,88 @@ def clean_llm_response(text: str) -> str:
 
     return text
 
-def normalize_dates_in_message(text: str) -> str:
+def interpret_date_range(user_message: str, today: datetime) -> tuple[int, int]:
     """
-    Busca expresiones de fecha/hora en lenguaje natural y las reemplaza
-    por formato estándar: 'dd/mm/yy a las HH:MM'.
+    Interpreta frases como "la semana que viene", "el miércoles que viene", etc.
+    Retorna (start_days_from_today, end_days_from_today)
     """
-    # Lista de patrones comunes (puedes ampliarla)
+    msg = user_message.lower()
+    weekday_names = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+    
+    # Caso: "la semana que viene" → días 7 a 13
+    if any(phrase in msg for phrase in ["semana que viene", "próxima semana", "semana próxima"]):
+        return 7, 13
+
+    # Caso: "el [día] que viene"
+    for i, day_name in enumerate(weekday_names):
+        if f"{day_name} que viene" in msg or f"próximo {day_name}" in msg:
+            # Días hasta el próximo X
+            days_ahead = (i - today.weekday() + 7) % 7
+            if days_ahead == 0:
+                days_ahead = 7  # si es hoy, ir al próximo
+            return days_ahead - 1, days_ahead + 1  # ±1 día de margen
+
+    # Caso: "en X días"
     import re
-    today = datetime.now().date()
-    parsed = parse(
-        text,
-        languages=['es'],
-        settings={
-            'PREFER_DATES_FROM': 'future',
-            'RELATIVE_BASE': datetime.combine(today, time(12, 0)),  # base al mediodía
-            'TIMEZONE': 'Europe/Madrid'
-        }
-    )
+    match = re.search(r"en\s+(\d+)\s*d[ií]as", msg)
+    if match:
+        n = int(match.group(1))
+        return n - 1, n + 2
 
-    if parsed and parsed.date() != today:
-        # Asumimos que el usuario se refiere a esa fecha
-        fecha_str = parsed.strftime("%d/%m/%y")
-        hora_str = parsed.strftime("%H:%M") if parsed.time() != time(0, 0) else None
+    # Caso: "del 20 al 25" → convertir a offsets
+    match = re.search(r"del\s+(\d+)\s+al\s+(\d+)", msg)
+    if match:
+        try:
+            day1, day2 = int(match.group(1)), int(match.group(2))
+            # Asumir mismo mes (simplificación)
+            date1 = today.replace(day=day1)
+            date2 = today.replace(day=day2)
+            if date1 < today:
+                date1 = date1.replace(month=date1.month + 1)
+            if date2 < today:
+                date2 = date2.replace(month=date2.month + 1)
+            start_offset = (date1 - today).days
+            end_offset = (date2 - today).days
+            return max(0, start_offset), min(21, end_offset)  # límite 3 semanas
+        except:
+            pass
 
-        # Si no especificó hora, asumimos ventana (mañana/tarde)
-        if not hora_str:
-            if "mañana" in text.lower() or "tarde" in text.lower():
-                hora_str = "17:00"
-            elif "mañana" in text.lower():  # "mañana por la mañana"
-                hora_str = "10:00"
-            elif "mediodía" in text.lower():
-                hora_str = "13:00"
-            else:
-                hora_str = "10:00"
+    # Por defecto: próximos 7 días
+    return 0, 6
 
-        return f"{fecha_str} a las {hora_str}"
+def normalize_date_string(date_str: str, today: datetime = None) -> str:
+    """
+    Convierte 'dd/mm', 'dd/mm/yy' o 'dd/mm/yyyy' a 'dd/mm/yy'.
+    Si es 'dd/mm', asume el año actual (o próximo si la fecha ya pasó).
+    """
+    if today is None:
+        today = datetime.today()
 
-    # Si no se detecta fecha clara, devolver el texto original
-    return text
+    parts = date_str.split('/')
+    day, month = parts[0], parts[1]
+
+    if len(parts) == 2:
+        # Solo dd/mm → adivinar año
+        try:
+            current_year = today.year
+            # Intentar con año actual
+            candidate = datetime(current_year, int(month), int(day))
+            # Si ya pasó, usar próximo año
+            if candidate.date() < today.date():
+                candidate = datetime(current_year + 1, int(month), int(day))
+            return candidate.strftime("%d/%m/%y")
+        except ValueError:
+            raise ValueError("Fecha inválida")
+    elif len(parts) == 3:
+        year = parts[2]
+        if len(year) == 2:
+            return f"{day}/{month}/{year}"
+        elif len(year) == 4:
+            return f"{day}/{month}/{year[2:]}"
+        else:
+            raise ValueError("Año inválido")
+    else:
+        raise ValueError("Formato de fecha no reconocido")
 
 THERAPY_OPTIONS = {
     "ondas": {
@@ -197,13 +247,13 @@ THERAPY_OPTIONS = {
         "first_visit": None,
         "options": [
             {"id": 94798, "name": "Láser"},
-            {"id": 110000, "name": "Tratamiento Laser"}
+            {"id": 110000, "name": "Tratamiento Láser"}
         ]
     },
     "osteopatía": {
-        "first_visit": {"id": 72651, "name": "Osteopatia 1ª visita"},
+        "first_visit": {"id": 72651, "name": "Osteopatía 1ª visita"},
         "options": [
-            {"id": 72576, "name": "Osteopatia"}
+            {"id": 72576, "name": "Osteopatía"}
         ]
     }
 }
@@ -216,36 +266,41 @@ class NaturalAppointmentAgent:
         today_str = today.strftime("%d/%m/%Y")
 
         self.conversation_history = [
-            {
-                "role": "system",
-                "content": (
-                    f"Hoy es {today_str}. Eres SecretarioAI, un asistente empático de agendamiento. "
-                    "Tu tarea es procesar el mensaje del usuario y responder siempre en formato JSON válido.\n\n"
-                    "REGLAS ESTRICAS:\n"
-                    "- NUNCA uses etiquetas como <think>, <reasoning> ni razonamiento interno visible.\n"
-                    "- NUNCA incluyas texto fuera del JSON.\n"
-                    "- Solo devuelve el objeto JSON, nada más.\n\n"
-                    "Formato de salida EXACTO:\n"
-                    '{\n'
-                    '  "respuesta": "mensaje amable y natural en español",\n'
-                    '  "data": {\n'
-                    '    "terapia": "?",\n'
-                    '    "subopcion": "?",\n'
-                    '    "fecha": "?",\n'
-                    '    "hora": "?"\n'
-                    '  }\n'
-                    '}\n\n'
-                    "Instrucciones:\n"
-                    "- terapia: uno de: Ondas, Fisioterapia, Indiba, Láser, Osteopatía.\n"
-                    "- subopcion: el nombre exacto de la opción elegida (ej: \"Fisioterapia\", \"Primera Visita Ondas\").\n"
-                    "- fecha: SIEMPRE dd/mm/yy (ej: 29/09/25).\n"
-                    "- hora: SIEMPRE HH:MM (ej: 08:15).\n"
-                    "- Si falta información, usa '?'.\n"
-                    "- **NUNCA inventes enlaces.**\n"
-                    "Si el usuario solo dice la terapia, **debes pedir la subopción** en 'respuesta', y dejar 'subopcion' como '?'."
-                )
-            }
-        ]
+                {
+                    "role": "system",
+                    "content": (
+                        f"Hoy es {today_str}. Eres SecretarioAI, un asistente empático de agendamiento.\n\n"
+                        "REGLAS ESTRICAS:\n"
+                        "- Responde SIEMPRE en JSON válido con este formato:\n"
+                        '{\n'
+                        '  "respuesta": "mensaje amable en español",\n'
+                        '  "data": {\n'
+                        '    "terapia": "?",\n'
+                        '    "subopcion": "?",\n'
+                        '    "fecha": "?",\n'
+                        '    "hora": "?"\n'
+                        '  }\n'
+                        '}\n\n'
+                        "INSTRUCCIONES:\n"
+                        "- Convierte CUALQUIER expresión de fecha/hora a formato estándar, usando HOY como base:\n"
+                        "  • 'el 27 a las 8' → fecha='27/10/25', hora='08:00'\n"
+                        "  • 'mañana' → fecha='17/10/25', hora='10:00'\n"
+                        "  • 'pasado mañana por la tarde' → fecha='18/10/25', hora='17:00'\n"
+                        "  • 'la semana que viene' → fecha='24/10/25', hora='10:00'\n"
+                        "  • 'el martes que viene' → fecha='21/10/25', hora='10:00'\n"
+                        "  • 'a las 3' → hora='15:00'\n"
+                        "- Formato de salida:\n"
+                        "  • fecha: SIEMPRE dd/mm/yy (ej: 27/10/25)\n"
+                        "  • hora: SIEMPRE HH:MM (ej: 08:00)\n"
+                        "- terapia: uno de: Ondas, Fisioterapia, Indiba, Láser, Osteopatía.\n"
+                        "- subopcion: nombre EXACTO de la opción (ej: \"Tratamiento Laser\", no \"tratamiento láser\").\n"
+                        "- Si el usuario dice 'láser' o 'Láser', normaliza a 'Láser'.\n"
+                        "- Si falta algo, pregunta con empatía en 'respuesta', y deja los campos como '?'.\n"
+                        "- **NUNCA digas 'formato inválido', 'error', ni nada técnico.**\n"
+                        "- **NUNCA inventes enlaces.**"
+                    )
+                }
+            ]
     
         groq_api_key = os.getenv('GROQ_API_KEY')
         self.client = Groq(api_key=groq_api_key)
@@ -286,13 +341,11 @@ class NaturalAppointmentAgent:
             print(f"Error al actualizar datos: {e}")
 
     def send_message(self, user_message: str) -> str:
-        normalized_message = normalize_dates_in_message(user_message)
-        print(f"[DEBUG] Mensaje original: {user_message}")
-        print(f"[DEBUG] Mensaje normalizado: {normalized_message}")
+        print(f"[DEBUG] 🧠 Estado actual de user_data: {self.user_data}")
 
         # Bienvenida inicial
         if len(self.conversation_history) == 1:
-            self.conversation_history.append({"role": "user", "content": normalized_message})
+            self.conversation_history.append({"role": "user", "content": user_message})
             response_text = (
                 "¡Hola! 👋 Soy tu asistente de agendamiento.\n\n"
                 "¿Qué tipo de terapia te gustaría reservar?\n\n"
@@ -301,17 +354,26 @@ class NaturalAppointmentAgent:
             self.conversation_history.append({"role": "assistant", "content": response_text})
             return response_text
 
-        # Añadir mensaje normalizado al historial
-        self.conversation_history.append({"role": "user", "content": normalized_message})
+        # Añadir mensaje al historial
+        self.conversation_history.append({"role": "user", "content": user_message})
 
         # Extraer datos del LLM
-        llm_response = self.extract_data_with_llm(normalized_message)
+        llm_response = self.extract_data_with_llm(user_message)
+        print(f"[DEBUG] 🤖 Respuesta LLM (raw): {llm_response}")
+
         try:
             parsed = json.loads(clean_llm_response(llm_response))
             data = parsed.get("data", {})
             reply = parsed.get("respuesta", "¿Podrías repetirlo?")
+            print(f"[DEBUG] 📦 Datos extraídos del LLM: {data}")
         except Exception as e:
-            return "Vaya, tuve un fallo técnico. ¿Me lo dices de nuevo? 😅"
+            print(f"[ERROR] ❌ JSON inválido: {e}")
+            reply = "Vaya, tuve un fallo técnico. ¿Me lo dices de nuevo? 😅"
+            self.conversation_history.append({"role": "assistant", "content": reply})
+            return reply
+
+        # Guardar estado anterior para comparar
+        prev_data = self.user_data.copy()
 
         # Actualizar solo campos válidos
         for key in ["terapia", "subopcion", "fecha", "hora"]:
@@ -319,11 +381,47 @@ class NaturalAppointmentAgent:
             if val and val != "?":
                 self.user_data[key] = val.strip()
 
+                # Normalización especial para "subopcion"
+        val = data.get("subopcion")
+        if val and val != "?":
+            # Normalizar: quitar acentos, estandarizar formato
+            import unicodedata
+            normalized_val = ''.join(c for c in unicodedata.normalize('NFD', val) if unicodedata.category(c) != 'Mn')
+            normalized_val = normalized_val.strip().title()
+
+            # Mapeo manual para coincidir EXACTAMENTE con THERAPY_OPTIONS
+            lower_val = normalized_val.lower()
+            if lower_val in ["tratamiento laser", "tratamiento láser", "laser tratamiento", "tratamiento con laser", "tratamiento"]:
+                normalized_val = "Tratamiento Láser"
+            elif lower_val in ["fisioterapia 1a visita", "fisio primera", "primera visita fisio", "fisioterapia primera", "primera fisio"]:
+                normalized_val = "Fisioterapia 1ª visita"
+            elif lower_val in ["osteopatia 1a visita", "osteopatía primera", "primera osteo"]:
+                normalized_val = "Osteopatía 1ª visita"
+            elif lower_val in ["ondas focales", "ondas focales tratamiento", "focales"]:
+                normalized_val = "Tratamiento Ondas Focales"
+            elif lower_val in ["ondas radiales", "tratamiento ondas radiales", "radiales"]:
+                normalized_val = "Tratamiento Ondas Radiales"
+            elif lower_val in ["indiba 45", "indiba 45 minutos", "indiba"]:
+                normalized_val = "Indiba 45'"
+            elif lower_val in ["indiba laser", "indiba + laser", "indiba y laser", "doble"]:
+                normalized_val = "Indiba + Láser"
+            elif lower_val in ["fisio+indiba+laser", "fisio indiba laser", "triple"]:
+                normalized_val = "Fisio+Indiba+Láser"
+
+            self.user_data["subopcion"] = normalized_val
+
+        # Mostrar qué cambió
+        if self.user_data != prev_data:
+            print(f"[DEBUG] ✅ user_data ACTUALIZADO: {self.user_data}")
+        else:
+            print(f"[DEBUG] ➖ user_data SIN CAMBIOS: {self.user_data}")
+
         terapia = self.user_data.get("terapia", "").lower()
         subopcion = self.user_data.get("subopcion")
 
-        # --- Paso 1: Terapia seleccionada, pero sin subopción → mostrar subopciones ---
+        # --- Paso 1: Terapia seleccionada, pero sin subopción ---
         if terapia and not subopcion:
+            print(f"[DEBUG] 🚶‍♂️ Entrando en PASO 1: terapia='{terapia}', subopcion no definida")
             if terapia not in THERAPY_OPTIONS:
                 self.user_data.pop("terapia", None)
                 return "No ofrecemos esa terapia. Por favor, elige entre: Ondas, Fisioterapia, Indiba, Láser u Osteopatía."
@@ -339,9 +437,9 @@ class NaturalAppointmentAgent:
             self.conversation_history.append({"role": "assistant", "content": msg})
             return msg
 
-        # --- Paso 2: Subopción seleccionada, pero sin fecha → mostrar disponibilidad ---
-        elif terapia and subopcion and "fecha" not in self.user_data:
-            # Buscar activity_id por nombre exacto de subopción
+        # --- Paso 2: Subopción seleccionada → disponibilidad dinámica ---
+        if terapia and subopcion and "fecha" not in self.user_data:
+            print(f"[DEBUG] 🚶‍♂️ Entrando en PASO 2: terapia='{terapia}', subopcion='{subopcion}'")
             activity_id = None
             config = THERAPY_OPTIONS.get(terapia)
             if config:
@@ -354,29 +452,30 @@ class NaturalAppointmentAgent:
                             break
 
             if not activity_id:
-                # Si no coincide, limpiar y pedir de nuevo
+                print(f"[DEBUG] ❌ Subopción no encontrada: '{subopcion}'")
                 self.user_data.pop("subopcion", None)
-                return "Opción no reconocida. Por favor, elige una de las listadas."
+                return "Opción no reconocida."
 
-            # Obtener disponibilidad (3 días con al menos 4 horarios)
-            available = get_available_dates_for_therapy(activity_id, days_ahead=7)
-            filtered = {}
-            for date_str, times in available.items():
-                if len(times) >= 4 and len(filtered) < 3:
-                    filtered[date_str] = times[:6]  # hasta 6 horarios
+            today = datetime.today()
+            start_off, end_off = interpret_date_range(user_message, today)
+            print(f"[DEBUG] 📅 Rango de búsqueda: hoy+{start_off} a hoy+{end_off} días")
 
-            if not filtered:
-                self.user_data.pop("subopcion", None)
-                return "Lo siento, no hay disponibilidad en los próximos días. ¿Quieres intentar con otra opción?"
+            available = get_available_dates_for_therapy(activity_id, start_offset=start_off, end_offset=end_off)
 
-            lines = [f"• **{date}**: {', '.join(times)}" for date, times in filtered.items()]
-            msg = "Elige una fecha y hora (responde con '18/10 a las 09:15', por ejemplo):\n" + "\n".join(lines)
+            if not available:
+                return "No hay disponibilidad en el periodo solicitado. ¿Quieres intentar con otro rango?"
+
+            filtered = {d: t for d, t in available.items() if len(t) >= 2}
+            lines = [f"• **{date}**: {', '.join(times[:5])}" for date, times in list(filtered.items())[:4]]
+            msg = "Elige una fecha y hora (ej: '20/10 a las 09:15'):\n" + "\n".join(lines)
             self.conversation_history.append({"role": "assistant", "content": msg})
             return msg
 
-        # --- Paso 3: Fecha y hora seleccionadas → generar enlace ---
+               # --- Paso 3: Fecha y hora seleccionadas → generar enlace ---
         elif terapia and subopcion and self.user_data.get("fecha") and self.user_data.get("hora"):
-            # Buscar activity_id (igual que arriba)
+            print(f"[DEBUG] 🎯 Entrando en PASO 3: ¡Todos los datos completos!")
+            
+            # Buscar activity_id
             activity_id = None
             config = THERAPY_OPTIONS.get(terapia)
             if config:
@@ -389,47 +488,53 @@ class NaturalAppointmentAgent:
                             break
 
             if not activity_id:
-                return "Error: opción no válida."
+                reply = "Lo siento, no encontré esa opción. ¿Podrías repetirme la terapia y el tipo de cita?"
+                self.user_data.clear()
+                self.conversation_history.append({"role": "assistant", "content": reply})
+                return reply
 
-            # Parsear fecha
             fecha_str = self.user_data["fecha"]
-            try:
-                if len(fecha_str.split("/")[2]) == 2:
-                    fecha_dt = datetime.strptime(fecha_str, "%d/%m/%y")
-                else:
-                    fecha_dt = datetime.strptime(fecha_str, "%d/%m/%Y")
-                fecha_iso = fecha_dt.strftime("%Y-%m-%d")
-            except Exception as e:
-                print(f"[ERROR] Fecha inválida: {e}")
-                return "Formato de fecha inválido. Usa dd/mm/yy."
-
-            # Parsear hora
             hora_str = self.user_data["hora"]
+
             try:
-                if ':' in hora_str:
-                    h, m = hora_str.split(':')
-                    hora_norm = f"{int(h):02d}:{int(m):02d}"
-                else:
-                    hora_norm = f"{int(hora_str):02d}:00"
+                # Convertir a formato ISO para la API
+                fecha_dt = datetime.strptime(fecha_str, "%d/%m/%y")
+                fecha_iso = fecha_dt.strftime("%Y-%m-%d")
+                
+                # Asegurar formato HH:MM
+                h, m = hora_str.split(':')
+                hora_norm = f"{int(h):02d}:{int(m):02d}"
+                
+                print(f"[DEBUG] 📅 Fecha/hora para API: {fecha_iso} a las {hora_norm}")
             except Exception as e:
-                print(f"[ERROR] Hora inválida: {e}")
-                return "Formato de hora inválido. Usa HH:MM."
+                print(f"[ERROR] El LLM no entregó fecha/hora en formato válido: fecha='{fecha_str}', hora='{hora_str}' | Error: {e}")
+                reply = "Vaya, tuve un pequeño fallo al procesar tu cita. ¿Podrías repetirme la fecha y hora? Por ejemplo: 'el 27 a las 8' o 'mañana por la tarde'."
+                self.conversation_history.append({"role": "assistant", "content": reply})
+                return reply
 
-            # 🔑 Verificar disponibilidad real → ¡aquí estaba el error!
-            slot_id_for_response = find_timp_slot(activity_id, fecha_iso, hora_norm)
-            if not slot_id_for_response:
-                return "Ese horario ya no está disponible. Por favor, elige otro."
+            # Verificar disponibilidad real
+            slot_id = find_timp_slot(activity_id, fecha_iso, hora_norm)
+            if not slot_id:
+                reply = "Lo siento, ese horario ya no está disponible. ¿Te gustaría proponer otro?"
+                # No reiniciar: permitir corregir solo fecha/hora
+                self.conversation_history.append({"role": "assistant", "content": reply})
+                return reply
 
-            # ✅ Generar enlace (¡URL corregida!)
             BRANCH_BUILDING_ID = "11269"
-            cita_url = f"https://web.timp.pro/home/{BRANCH_BUILDING_ID}#/home/{BRANCH_BUILDING_ID}/branch_building/admissions/{slot_id_for_response}"
-            print(f"[DEBUG] ✅ Generando enlace: {cita_url}")
-            msg = f"✅ **¡Listo!** Haz clic aquí para confirmar tu cita: {cita_url}\n\n¿Te gustaría agendar otra cita o necesitas ayuda con algo más? 😊"
+            cita_url = f"https://web.timp.pro/home/{BRANCH_BUILDING_ID}#/home/{BRANCH_BUILDING_ID}/branch_building/admissions/{slot_id}"
+            print(f"[DEBUG] 🔗 Enlace generado: {cita_url}")
+            msg = f"✅ **¡Listo!** Haz clic aquí para confirmar tu cita: {cita_url}\n\n¿Te gustaría agendar otra cita? 😊"
 
-            # Reiniciar estado
+            # Reiniciar estado tras éxito
             self.user_data = {}
+            print(f"[DEBUG] 🧹 user_data REINICIADO tras cita exitosa")
             self.conversation_history.append({"role": "assistant", "content": msg})
             return msg
+
+        # --- Por defecto: responder con el mensaje del LLM ---
+        print(f"[DEBUG] 💬 Respondiendo con el mensaje del LLM: {reply}")
+        self.conversation_history.append({"role": "assistant", "content": reply})
+        return reply
         
 # Instancia global
 agent = NaturalAppointmentAgent()
